@@ -1,6 +1,8 @@
 package templates
 
 import (
+	"cmp"
+
 	"github.com/chasefleming/elem-go"
 	"github.com/chasefleming/elem-go/attrs"
 	"github.com/chasefleming/elem-go/styles"
@@ -31,11 +33,11 @@ type RegisterConfirmInfo struct {
 	User string
 
 	// Hostname is the hostname the registering tailscaled instance
-	// reported in its RegisterRequest.
+	// reported in its [tailcfg.RegisterRequest].
 	Hostname string
 
 	// OS is the operating system the registering tailscaled reported.
-	// May be the empty string when the client did not send Hostinfo.
+	// May be the empty string when the client did not send [tailcfg.Hostinfo].
 	OS string
 
 	// MachineKey is the short fingerprint of the registering machine
@@ -51,11 +53,11 @@ type RegisterConfirmInfo struct {
 // IdP allows silent SSO.
 func RegisterConfirm(info RegisterConfirmInfo) *elem.Element {
 	deviceList := deviceTable(
-		[4][2]string{
-			{"Hostname", info.Hostname},
-			{"OS", displayOrUnknown(info.OS)},
-			{"Machine key", info.MachineKey},
-			{"Registered to", info.User},
+		[]deviceRow{
+			{"Hostname", elem.Text(info.Hostname)},
+			{"OS", elem.Text(cmp.Or(info.OS, "(unknown)"))},
+			{"Machine key", Code(elem.Text(info.MachineKey))},
+			{"Registered to", elem.Text(info.User)},
 		},
 	)
 
@@ -75,50 +77,47 @@ func RegisterConfirm(info RegisterConfirmInfo) *elem.Element {
 		),
 	)
 
-	return HtmlStructure(
-		elem.Title(nil, elem.Text("Headscale - Confirm node registration")),
-		mdTypesetBody(
-			headscaleLogo(),
-			H2(elem.Text("Confirm node registration")),
-			P(elem.Text(
-				"A device is asking to be added to your tailnet. "+
-					"Please review the details below and confirm that this device is yours.",
-			)),
-			deviceList,
-			form,
-			P(elem.Text(
-				"If you do not recognise this device, close this window. "+
-					"The registration request will expire automatically.",
-			)),
-			pageFooter(),
-		),
+	return page(
+		"Headscale - Confirm node registration",
+		H2(elem.Text("Confirm node registration")),
+		P(elem.Text(
+			"A device is asking to be added to your tailnet. "+
+				"Please review the details below and confirm that this device is yours.",
+		)),
+		deviceList,
+		form,
+		P(elem.Text(
+			"If you do not recognise this device, close this window. "+
+				"The registration request will expire automatically.",
+		)),
 	)
 }
 
-func deviceTable(rows [4][2]string) *elem.Element {
+type deviceRow struct {
+	label string
+	value elem.Node
+}
+
+func deviceTable(rows []deviceRow) *elem.Element {
 	tableRows := make([]elem.Node, 0, len(rows))
 	for _, row := range rows {
-		val := elem.Node(elem.Text(row[1]))
-		if row[0] == "Machine key" {
-			val = Code(elem.Text(row[1]))
-		}
-
-		tableRows = append(tableRows, elem.Tr(nil,
+		tableRows = append(tableRows, elem.Tr(
+			nil,
 			elem.Td(attrs.Props{
 				attrs.Style: styles.Props{
 					styles.Padding:      "0.5rem 1rem 0.5rem 0",
 					styles.FontWeight:   "600",
 					styles.WhiteSpace:   "nowrap",
 					styles.Color:        "var(--md-default-fg-color--light)",
-					styles.BorderBottom: "1px solid var(--hs-border)",
+					styles.BorderBottom: cssBorderHS,
 				}.ToInline(),
-			}, elem.Text(row[0])),
+			}, elem.Text(row.label)),
 			elem.Td(attrs.Props{
 				attrs.Style: styles.Props{
 					styles.Padding:      "0.5rem 0",
-					styles.BorderBottom: "1px solid var(--hs-border)",
+					styles.BorderBottom: cssBorderHS,
 				}.ToInline(),
-			}, val),
+			}, row.value),
 		))
 	}
 
@@ -130,12 +129,4 @@ func deviceTable(rows [4][2]string) *elem.Element {
 			styles.MarginBottom:   "1.5em",
 		}.ToInline(),
 	}, tableRows...)
-}
-
-func displayOrUnknown(s string) string {
-	if s == "" {
-		return "(unknown)"
-	}
-
-	return s
 }

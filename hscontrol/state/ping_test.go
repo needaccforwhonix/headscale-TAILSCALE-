@@ -1,6 +1,7 @@
 package state
 
 import (
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -79,14 +80,10 @@ func TestPingTracker_ConcurrentDifferentIDs(t *testing.T) {
 	// Complete in reverse order concurrently.
 	var wg sync.WaitGroup
 
-	for i := count - 1; i >= 0; i-- {
-		wg.Add(1)
-
-		go func(idx int) {
-			defer wg.Done()
-
-			assert.True(t, pt.complete(ids[idx]))
-		}(i)
+	for _, id := range slices.Backward(ids) {
+		wg.Go(func() {
+			assert.True(t, pt.complete(id))
+		})
 	}
 
 	// All channels should receive.
@@ -138,6 +135,27 @@ func TestPingTracker_TwoToSameNode(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for second ping")
 	}
+}
+
+func TestPingTracker_Drain(t *testing.T) {
+	pt := newPingTracker()
+
+	_, ch1 := pt.register(types.NodeID(1))
+	_, ch2 := pt.register(types.NodeID(2))
+
+	pt.drain()
+
+	// Drained channels must be closed so blocked readers unblock.
+	for i, ch := range []<-chan time.Duration{ch1, ch2} {
+		select {
+		case _, ok := <-ch:
+			assert.False(t, ok, "channel %d should be closed, got value", i)
+		case <-time.After(time.Second):
+			t.Fatalf("channel %d not closed by drain", i)
+		}
+	}
+
+	assert.Empty(t, pt.pending, "pending map should be empty after drain")
 }
 
 func TestPingTracker_LatencyNonNegative(t *testing.T) {

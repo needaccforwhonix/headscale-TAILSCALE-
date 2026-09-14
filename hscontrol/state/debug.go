@@ -2,11 +2,12 @@ package state
 
 import (
 	"fmt"
+	"net/netip"
+	"slices"
 	"strings"
 	"time"
 
 	hsdb "github.com/juanfont/headscale/hscontrol/db"
-	"github.com/juanfont/headscale/hscontrol/routes"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"tailscale.com/tailcfg"
 )
@@ -34,16 +35,16 @@ type DebugOverviewInfo struct {
 
 // DebugDERPInfo represents DERP map information in a structured format.
 type DebugDERPInfo struct {
-	Configured   bool                     `json:"configured"`
-	TotalRegions int                      `json:"total_regions"`
-	Regions      map[int]*DebugDERPRegion `json:"regions,omitempty"`
+	Configured   bool                                      `json:"configured"`
+	TotalRegions int                                       `json:"total_regions"`
+	Regions      map[tailcfg.DERPRegionID]*DebugDERPRegion `json:"regions,omitempty"`
 }
 
 // DebugDERPRegion represents a single DERP region.
 type DebugDERPRegion struct {
-	RegionID   int              `json:"region_id"`
-	RegionName string           `json:"region_name"`
-	Nodes      []*DebugDERPNode `json:"nodes"`
+	RegionID   tailcfg.DERPRegionID `json:"region_id"`
+	RegionName string               `json:"region_name"`
+	Nodes      []*DebugDERPNode     `json:"nodes"`
 }
 
 // DebugDERPNode represents a single DERP node.
@@ -61,51 +62,23 @@ type DebugStringInfo struct {
 
 // DebugOverview returns a comprehensive overview of the current state for debugging.
 func (s *State) DebugOverview() string {
-	allNodes := s.nodeStore.ListNodes()
-	users, _ := s.ListAllUsers()
+	info := s.DebugOverviewJSON()
 
 	var sb strings.Builder
 
 	sb.WriteString("=== Headscale State Overview ===\n\n")
 
 	// Node statistics
-	fmt.Fprintf(&sb, "Nodes: %d total\n", allNodes.Len())
-
-	userNodeCounts := make(map[string]int)
-	onlineCount := 0
-	expiredCount := 0
-	ephemeralCount := 0
-
-	now := time.Now()
-
-	for _, node := range allNodes.All() {
-		if node.Valid() {
-			userName := node.Owner().Name()
-			userNodeCounts[userName]++
-
-			if node.IsOnline().Valid() && node.IsOnline().Get() {
-				onlineCount++
-			}
-
-			if node.Expiry().Valid() && node.Expiry().Get().Before(now) {
-				expiredCount++
-			}
-
-			if node.AuthKey().Valid() && node.AuthKey().Ephemeral() {
-				ephemeralCount++
-			}
-		}
-	}
-
-	fmt.Fprintf(&sb, "  - Online: %d\n", onlineCount)
-	fmt.Fprintf(&sb, "  - Expired: %d\n", expiredCount)
-	fmt.Fprintf(&sb, "  - Ephemeral: %d\n", ephemeralCount)
+	fmt.Fprintf(&sb, "Nodes: %d total\n", info.Nodes.Total)
+	fmt.Fprintf(&sb, "  - Online: %d\n", info.Nodes.Online)
+	fmt.Fprintf(&sb, "  - Expired: %d\n", info.Nodes.Expired)
+	fmt.Fprintf(&sb, "  - Ephemeral: %d\n", info.Nodes.Ephemeral)
 	sb.WriteString("\n")
 
 	// User statistics
-	fmt.Fprintf(&sb, "Users: %d total\n", len(users))
+	fmt.Fprintf(&sb, "Users: %d total\n", info.TotalUsers)
 
-	for userName, nodeCount := range userNodeCounts {
+	for userName, nodeCount := range info.Users {
 		fmt.Fprintf(&sb, "  - %s: %d nodes\n", userName, nodeCount)
 	}
 
@@ -113,18 +86,17 @@ func (s *State) DebugOverview() string {
 
 	// Policy information
 	sb.WriteString("Policy:\n")
-	fmt.Fprintf(&sb, "  - Mode: %s\n", s.cfg.Policy.Mode)
+	fmt.Fprintf(&sb, "  - Mode: %s\n", info.Policy.Mode)
 
-	if s.cfg.Policy.Mode == types.PolicyModeFile {
-		fmt.Fprintf(&sb, "  - Path: %s\n", s.cfg.Policy.Path)
+	if info.Policy.Mode == string(types.PolicyModeFile) {
+		fmt.Fprintf(&sb, "  - Path: %s\n", info.Policy.Path)
 	}
 
 	sb.WriteString("\n")
 
 	// DERP information
-	derpMap := s.derpMap.Load()
-	if derpMap != nil {
-		fmt.Fprintf(&sb, "DERP: %d regions configured\n", len(derpMap.Regions))
+	if info.DERP.Configured {
+		fmt.Fprintf(&sb, "DERP: %d regions configured\n", info.DERP.Regions)
 	} else {
 		sb.WriteString("DERP: not configured\n")
 	}
@@ -132,12 +104,7 @@ func (s *State) DebugOverview() string {
 	sb.WriteString("\n")
 
 	// Route information
-	routeCount := len(strings.Split(strings.TrimSpace(s.primaryRoutes.String()), "\n"))
-	if s.primaryRoutes.String() == "" {
-		routeCount = 0
-	}
-
-	fmt.Fprintf(&sb, "Primary Routes: %d active\n", routeCount)
+	fmt.Fprintf(&sb, "Primary Routes: %d active\n", info.PrimaryRoutes)
 	sb.WriteString("\n")
 
 	// Registration cache
@@ -147,7 +114,7 @@ func (s *State) DebugOverview() string {
 	return sb.String()
 }
 
-// DebugNodeStore returns debug information about the NodeStore.
+// DebugNodeStore returns debug information about the [NodeStore].
 func (s *State) DebugNodeStore() string {
 	return s.nodeStore.DebugString()
 }
@@ -253,9 +220,55 @@ func (s *State) DebugFilter() ([]tailcfg.FilterRule, error) {
 	return filter, nil
 }
 
-// DebugRoutes returns the current primary routes information as a structured object.
-func (s *State) DebugRoutes() routes.DebugRoutes {
-	return s.primaryRoutes.DebugJSON()
+// DebugRoutes returns the current primary routes information as a
+// structured object built from the [NodeStore] snapshot.
+func (s *State) DebugRoutes() types.DebugRoutes {
+	debug := types.DebugRoutes{
+		AvailableRoutes: make(map[types.NodeID][]netip.Prefix),
+		PrimaryRoutes:   make(map[string]types.NodeID),
+	}
+
+	for _, nv := range s.nodeStore.ListNodes().All() {
+		if !nv.Valid() {
+			continue
+		}
+
+		online, known := nv.IsOnline().GetOk()
+		if !known || !online {
+			continue
+		}
+
+		approved := nv.AllApprovedRoutes()
+		if len(approved) == 0 {
+			continue
+		}
+
+		slices.SortFunc(approved, netip.Prefix.Compare)
+		debug.AvailableRoutes[nv.ID()] = approved
+	}
+
+	for prefix, id := range s.nodeStore.PrimaryRoutes() {
+		debug.PrimaryRoutes[prefix.String()] = id
+	}
+
+	var unhealthy []types.NodeID
+
+	for _, nv := range s.nodeStore.ListNodes().All() {
+		if !nv.Valid() {
+			continue
+		}
+
+		if !s.nodeStore.IsNodeHealthy(nv.ID()) {
+			unhealthy = append(unhealthy, nv.ID())
+		}
+	}
+
+	if len(unhealthy) > 0 {
+		slices.Sort(unhealthy)
+		debug.UnhealthyNodes = unhealthy
+	}
+
+	return debug
 }
 
 // DebugRoutesString returns the current primary routes information as a string.
@@ -322,12 +335,7 @@ func (s *State) DebugOverviewJSON() DebugOverviewInfo {
 	}
 
 	// Route information
-	routeCount := len(strings.Split(strings.TrimSpace(s.primaryRoutes.String()), "\n"))
-	if s.primaryRoutes.String() == "" {
-		routeCount = 0
-	}
-
-	info.PrimaryRoutes = routeCount
+	info.PrimaryRoutes = len(s.nodeStore.PrimaryRoutes())
 
 	return info
 }
@@ -338,7 +346,7 @@ func (s *State) DebugDERPJSON() DebugDERPInfo {
 
 	info := DebugDERPInfo{
 		Configured: derpMap != nil,
-		Regions:    make(map[int]*DebugDERPRegion),
+		Regions:    make(map[tailcfg.DERPRegionID]*DebugDERPRegion),
 	}
 
 	if derpMap == nil {
@@ -370,7 +378,7 @@ func (s *State) DebugDERPJSON() DebugDERPInfo {
 	return info
 }
 
-// DebugNodeStoreJSON returns the actual nodes map from the current NodeStore snapshot.
+// DebugNodeStoreJSON returns the actual nodes map from the current [NodeStore] snapshot.
 func (s *State) DebugNodeStoreJSON() map[types.NodeID]types.Node {
 	snapshot := s.nodeStore.data.Load()
 	return snapshot.nodesByID

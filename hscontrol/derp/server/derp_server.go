@@ -76,20 +76,16 @@ func (d *DERPServer) GenerateRegion() (tailcfg.DERPRegion, error) {
 		return tailcfg.DERPRegion{}, err
 	}
 
-	var (
-		host    string
-		port    int
-		portStr string
-	)
-
 	// Extract hostname and port from URL
-	host, portStr, err = net.SplitHostPort(serverURL.Host)
+	host, portStr, err := net.SplitHostPort(serverURL.Host)
+
+	var port int
+
 	if err != nil {
+		host = serverURL.Host
 		if serverURL.Scheme == "https" {
-			host = serverURL.Host
 			port = 443
 		} else {
-			host = serverURL.Host
 			port = 80
 		}
 	} else {
@@ -116,10 +112,9 @@ func (d *DERPServer) GenerateRegion() (tailcfg.DERPRegion, error) {
 		RegionID:   d.cfg.ServerRegionID,
 		RegionCode: d.cfg.ServerRegionCode,
 		RegionName: d.cfg.ServerRegionName,
-		Avoid:      false,
 		Nodes: []*tailcfg.DERPNode{
 			{
-				Name:     strconv.Itoa(d.cfg.ServerRegionID),
+				Name:     d.cfg.ServerRegionID.String(),
 				RegionID: d.cfg.ServerRegionID,
 				HostName: host,
 				DERPPort: port,
@@ -371,15 +366,10 @@ func (d *DERPServer) ServeSTUN() {
 }
 
 func serverSTUNListener(ctx context.Context, packetConn *net.UDPConn) {
-	var (
-		buf       [64 << 10]byte
-		bytesRead int
-		udpAddr   *net.UDPAddr
-		err       error
-	)
+	var buf [64 << 10]byte
 
 	for {
-		bytesRead, udpAddr, err = packetConn.ReadFromUDP(buf[:])
+		bytesRead, udpAddr, err := packetConn.ReadFromUDP(buf[:])
 		if err != nil {
 			if ctx.Err() != nil {
 				return

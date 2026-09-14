@@ -1,18 +1,38 @@
 package types
 
 import (
+	"strconv"
 	"time"
 
-	v1 "github.com/juanfont/headscale/gen/go/headscale/v1"
+	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/juanfont/headscale/hscontrol/util/zlog/zf"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
-	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 type PAKError string
 
 func (e PAKError) Error() string { return string(e) }
+
+// StringID returns the key's id as a decimal string, the form the HTTP APIs
+// render it as.
+func (pak *PreAuthKey) StringID() string {
+	if pak == nil {
+		return ""
+	}
+
+	return strconv.FormatUint(pak.ID, util.Base10)
+}
+
+// StringID returns the key's id as a decimal string, the form the HTTP APIs
+// render it as.
+func (pak *PreAuthKeyNew) StringID() string {
+	if pak == nil {
+		return ""
+	}
+
+	return strconv.FormatUint(pak.ID, util.Base10)
+}
 
 // PreAuthKey describes a pre-authorization key usable in a particular user.
 type PreAuthKey struct {
@@ -25,11 +45,15 @@ type PreAuthKey struct {
 	Prefix string
 	Hash   []byte // bcrypt
 
-	// For tagged keys: UserID tracks who created the key (informational)
-	// For user-owned keys: UserID tracks the node owner
+	// For tagged keys: [PreAuthKey.UserID] tracks who created the key (informational)
+	// For user-owned keys: [PreAuthKey.UserID] tracks the node owner
 	// Can be nil for system-created tagged keys
 	UserID *uint
 	User   *User `gorm:"constraint:OnDelete:SET NULL;"`
+
+	// Free-text description, set via the v2 API. Empty for keys created through
+	// the v1 API or CLI.
+	Description string
 
 	Reusable  bool
 	Ephemeral bool `gorm:"default:false"`
@@ -42,6 +66,11 @@ type PreAuthKey struct {
 
 	CreatedAt  *time.Time
 	Expiration *time.Time
+
+	// Revoked is set when the key is revoked through the v2 API (Tailscale's
+	// DELETE). A revoked key is invalid but kept retrievable until the
+	// background collector reaps it after the configured retention window.
+	Revoked *time.Time
 }
 
 // PreAuthKeyNew is returned once when the key is created.
@@ -56,77 +85,21 @@ type PreAuthKeyNew struct {
 	User       *User // Can be nil for system-created tagged keys
 }
 
-func (key *PreAuthKeyNew) Proto() *v1.PreAuthKey {
-	protoKey := v1.PreAuthKey{
-		Id:        key.ID,
-		Key:       key.Key,
-		User:      nil, // Will be set below if not nil
-		Reusable:  key.Reusable,
-		Ephemeral: key.Ephemeral,
-		AclTags:   key.Tags,
-	}
-
-	if key.User != nil {
-		protoKey.User = key.User.Proto()
-	}
-
-	if key.Expiration != nil {
-		protoKey.Expiration = timestamppb.New(*key.Expiration)
-	}
-
-	if key.CreatedAt != nil {
-		protoKey.CreatedAt = timestamppb.New(*key.CreatedAt)
-	}
-
-	return &protoKey
-}
-
-func (key *PreAuthKey) Proto() *v1.PreAuthKey {
-	protoKey := v1.PreAuthKey{
-		User:      nil, // Will be set below if not nil
-		Id:        key.ID,
-		Ephemeral: key.Ephemeral,
-		Reusable:  key.Reusable,
-		Used:      key.Used,
-		AclTags:   key.Tags,
-	}
-
-	if key.User != nil {
-		protoKey.User = key.User.Proto()
-	}
-
-	// For new keys (with prefix/hash), show the prefix so users can identify the key
-	// For legacy keys (with plaintext key), show the full key for backwards compatibility
-	if key.Prefix != "" {
-		protoKey.Key = "hskey-auth-" + key.Prefix + "-***"
-	} else if key.Key != "" {
-		// Legacy key - show full key for backwards compatibility
-		// TODO: Consider hiding this in a future major version
-		protoKey.Key = key.Key
-	}
-
-	if key.Expiration != nil {
-		protoKey.Expiration = timestamppb.New(*key.Expiration)
-	}
-
-	if key.CreatedAt != nil {
-		protoKey.CreatedAt = timestamppb.New(*key.CreatedAt)
-	}
-
-	return &protoKey
-}
-
 // Validate checks if a pre auth key can be used.
 func (pak *PreAuthKey) Validate() error {
 	if pak == nil {
 		return PAKError("invalid authkey")
 	}
 
-	// Use EmbedObject for safe logging - never log full key
+	// Use [zerolog.Event.EmbedObject] for safe logging - never log full key
 	log.Debug().
 		Caller().
 		EmbedObject(pak).
 		Msg("PreAuthKey.Validate: checking key")
+
+	if pak.Revoked != nil {
+		return PAKError("authkey revoked")
+	}
 
 	if pak.Expiration != nil && pak.Expiration.Before(time.Now()) {
 		return PAKError("authkey expired")
@@ -144,8 +117,8 @@ func (pak *PreAuthKey) Validate() error {
 	return nil
 }
 
-// IsTagged returns true if this PreAuthKey creates tagged nodes.
-// When a PreAuthKey has tags, nodes registered with it will be tagged nodes.
+// IsTagged returns true if this [PreAuthKey] creates tagged nodes.
+// When a [PreAuthKey] has tags, nodes registered with it will be tagged nodes.
 func (pak *PreAuthKey) IsTagged() bool {
 	return len(pak.Tags) > 0
 }
@@ -160,7 +133,7 @@ func (pak *PreAuthKey) maskedPrefix() string {
 	return ""
 }
 
-// MarshalZerologObject implements zerolog.LogObjectMarshaler for safe logging.
+// MarshalZerologObject implements [zerolog.LogObjectMarshaler] for safe logging.
 // SECURITY: This method intentionally does NOT log the full key or hash.
 // Only the masked prefix is logged for identification purposes.
 func (pak *PreAuthKey) MarshalZerologObject(e *zerolog.Event) {

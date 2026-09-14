@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
@@ -32,9 +33,13 @@ const (
 
 var (
 	errOidcMutuallyExclusive     = errors.New("oidc_client_secret and oidc_client_secret_path are mutually exclusive")
+	errOIDCIssuerInvalid         = errors.New("oidc.issuer must be a valid http(s) URL")
+	errOIDCClientIDRequired      = errors.New("oidc.client_id is required when oidc.issuer is set")
+	errOIDCClientSecretRequired  = errors.New("oidc.client_secret or oidc.client_secret_path is required when oidc.issuer is set")
 	errServerURLSuffix           = errors.New("server_url cannot be part of base_domain in a way that could make the DERP and headscale server unreachable")
 	errServerURLSame             = errors.New("server_url cannot use the same domain as base_domain in a way that could make the DERP and headscale server unreachable")
 	errInvalidPKCEMethod         = errors.New("pkce.method must be either 'plain' or 'S256'")
+	errTrustedProxyZeroRange     = errors.New("0.0.0.0/0 and ::/0 are not allowed")
 	ErrNoPrefixConfigured        = errors.New("no IPv4 or IPv6 prefix configured, minimum one prefix is required")
 	ErrInvalidAllocationStrategy = errors.New("invalid prefix allocation strategy")
 )
@@ -67,13 +72,21 @@ type HARouteConfig struct {
 	ProbeInterval time.Duration
 
 	// ProbeTimeout is the maximum time to wait for a probe response
-	// before declaring a node unhealthy. Must be less than ProbeInterval.
+	// before declaring a node unhealthy. Must be less than [HARouteConfig.ProbeInterval].
 	ProbeTimeout time.Duration
 }
 
 // RouteConfig contains configuration for route behaviour.
 type RouteConfig struct {
 	HA HARouteConfig
+}
+
+// PreAuthKeysConfig contains configuration for pre-auth key lifecycle.
+type PreAuthKeysConfig struct {
+	// RevokedRetention is how long a soft-revoked pre-auth key (revoked via the
+	// v2 API's DELETE) is kept retrievable before the background collector
+	// hard-deletes it. A zero or negative duration disables the collector.
+	RevokedRetention time.Duration
 }
 
 // NodeConfig contains configuration for node lifecycle and expiry.
@@ -96,9 +109,9 @@ type Config struct {
 	ServerURL           string
 	Addr                string
 	MetricsAddr         string
-	GRPCAddr            string
-	GRPCAllowInsecure   bool
+	TrustedProxies      []netip.Prefix
 	Node                NodeConfig
+	PreAuthKeys         PreAuthKeysConfig
 	PrefixV4            *netip.Prefix
 	PrefixV6            *netip.Prefix
 	IPAllocation        IPAllocationStrategy
@@ -118,7 +131,7 @@ type Config struct {
 
 	// DNSConfig is the headscale representation of the DNS configuration.
 	// It is kept in the config update for some settings that are
-	// not directly converted into a tailcfg.DNSConfig.
+	// not directly converted into a [tailcfg.DNSConfig].
 	DNSConfig DNSConfig
 
 	// TailcfgDNSConfig is the tailcfg representation of the DNS configuration,
@@ -130,9 +143,9 @@ type Config struct {
 
 	OIDC OIDCConfig
 
-	LogTail             LogTailConfig
-	RandomizeClientPort bool
-	Taildrop            TaildropConfig
+	LogTail    LogTailConfig
+	Taildrop   TaildropConfig
+	AutoUpdate AutoUpdateConfig
 
 	CLI CLIConfig
 
@@ -231,7 +244,7 @@ type OIDCConfig struct {
 type DERPConfig struct {
 	ServerEnabled                      bool
 	AutomaticallyAddEmbeddedDerpRegion bool
-	ServerRegionID                     int
+	ServerRegionID                     tailcfg.DERPRegionID
 	ServerRegionCode                   string
 	ServerRegionName                   string
 	ServerPrivateKeyPath               string
@@ -251,6 +264,15 @@ type LogTailConfig struct {
 }
 
 type TaildropConfig struct {
+	Enabled bool
+}
+
+// AutoUpdateConfig controls the tailnet-wide default for client
+// auto-update. When Enabled is true, headscale emits the
+// [tailcfg.NodeAttrDefaultAutoUpdate] cap with value [true] on every
+// node's CapMap; clients fall back to that default unless they have
+// opted in or out locally.
+type AutoUpdateConfig struct {
 	Enabled bool
 }
 
@@ -326,7 +348,7 @@ type Tuning struct {
 	// NodeStoreBatchTimeout is the maximum time to wait before processing a
 	// partial batch of node operations.
 	//
-	// When NodeStoreBatchSize operations haven't accumulated, this timeout ensures
+	// When [Tuning.NodeStoreBatchSize] operations haven't accumulated, this timeout ensures
 	// writes don't wait indefinitely. The batch processes when either the size
 	// threshold is reached OR this timeout expires, whichever comes first.
 	//
@@ -344,8 +366,37 @@ func validatePKCEMethod(method string) error {
 	return nil
 }
 
-// Domain returns the hostname/domain part of the ServerURL.
-// If the ServerURL is not a valid URL, it returns the BaseDomain.
+// validateOIDCConfig validates the OIDC settings, called when oidc.issuer is
+// set. It fails fast on a setup that cannot work: an invalid PKCE method, a
+// malformed issuer URL (which would otherwise surface as an opaque discovery
+// error or, worse, resolve to an unintended provider), or a missing client
+// id/secret.
+func validateOIDCConfig() error {
+	err := validatePKCEMethod(viper.GetString("oidc.pkce.method"))
+	if err != nil {
+		return err
+	}
+
+	issuer := viper.GetString("oidc.issuer")
+
+	u, err := url.Parse(issuer)
+	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
+		return fmt.Errorf("%w: got %q", errOIDCIssuerInvalid, issuer)
+	}
+
+	if viper.GetString("oidc.client_id") == "" {
+		return errOIDCClientIDRequired
+	}
+
+	if viper.GetString("oidc.client_secret") == "" && viper.GetString("oidc.client_secret_path") == "" {
+		return errOIDCClientSecretRequired
+	}
+
+	return nil
+}
+
+// Domain returns the hostname/domain part of the [Config.ServerURL].
+// If the [Config.ServerURL] is not a valid URL, it returns the [Config.BaseDomain].
 func (c *Config) Domain() string {
 	u, err := url.Parse(c.ServerURL)
 	if err != nil {
@@ -358,7 +409,7 @@ func (c *Config) Domain() string {
 // LoadConfig prepares and loads the Headscale configuration into Viper.
 // This means it sets the default values, reads the configuration file and
 // environment variables, and handles deprecated configuration options.
-// It has to be called before LoadServerConfig and LoadCLIConfig.
+// It has to be called before [LoadServerConfig] and [LoadCLIConfig].
 // The configuration is not validated and the caller should check for errors
 // using a validation function.
 func LoadConfig(path string, isFile bool) error {
@@ -406,9 +457,6 @@ func LoadConfig(path string, isFile bool) error {
 	viper.SetDefault("unix_socket", "/var/run/headscale/headscale.sock")
 	viper.SetDefault("unix_socket_permission", "0o770")
 
-	viper.SetDefault("grpc_listen_addr", ":50443")
-	viper.SetDefault("grpc_allow_insecure", false)
-
 	viper.SetDefault("cli.timeout", "5s")
 	viper.SetDefault("cli.insecure", false)
 
@@ -428,11 +476,12 @@ func LoadConfig(path string, isFile bool) error {
 	viper.SetDefault("oidc.email_verified_required", true)
 
 	viper.SetDefault("logtail.enabled", false)
-	viper.SetDefault("randomize_client_port", false)
 	viper.SetDefault("taildrop.enabled", true)
+	viper.SetDefault("auto_update.enabled", false)
 
 	viper.SetDefault("node.expiry", "0")
 	viper.SetDefault("node.ephemeral.inactivity_timeout", "120s")
+	viper.SetDefault("preauth_keys.revoked_retention", "168h")
 	viper.SetDefault("node.routes.ha.probe_interval", "10s")
 	viper.SetDefault("node.routes.ha.probe_timeout", "5s")
 
@@ -530,14 +579,27 @@ func validateServerConfig() error {
 	depr.fatal("oidc.strip_email_domain")
 	depr.fatal("oidc.map_legacy_users")
 
+	// Removed since v0.29.0: `randomize_client_port` moved to the ACL
+	// policy as a top-level `randomizeClientPort` field, matching the
+	// Tailscale-hosted control plane schema. Per-node `nodeAttrs`
+	// entries granting `https://tailscale.com/cap/randomize-client-port`
+	// also work.
+	depr.fatalWithHint("randomize_client_port",
+		`Set "randomizeClientPort": true at the top level of your policy file `+
+			`(see policy.path / policy.mode), or grant the cap per-node via a `+
+			`"nodeAttrs" entry. See CHANGELOG.md (BREAKING / Configuration).`)
+
 	// Deprecated: ephemeral_node_inactivity_timeout -> node.ephemeral.inactivity_timeout
 	depr.warnNoAlias("node.ephemeral.inactivity_timeout", "ephemeral_node_inactivity_timeout")
 
 	// Removed: oidc.expiry -> node.expiry
 	depr.fatalIfSet("oidc.expiry", "node.expiry")
 
-	if viper.GetBool("oidc.enabled") {
-		err := validatePKCEMethod(viper.GetString("oidc.pkce.method"))
+	// OIDC is activated by setting oidc.issuer (see app.go), not by a
+	// dedicated oidc.enabled key. Gate validation on the real activation
+	// condition so a misconfiguration fails at startup.
+	if viper.GetString("oidc.issuer") != "" {
+		err := validateOIDCConfig()
 		if err != nil {
 			return err
 		}
@@ -580,7 +642,7 @@ func validateServerConfig() error {
 
 	// Minimum inactivity time out is keepalive timeout (60s) plus a few seconds
 	// to avoid races
-	minInactivityTimeout, _ := time.ParseDuration("65s")
+	minInactivityTimeout := 65 * time.Second
 
 	ephemeralTimeout := resolveEphemeralInactivityTimeout()
 	if ephemeralTimeout <= minInactivityTimeout {
@@ -669,7 +731,7 @@ func tlsConfig() TLSConfig {
 
 func derpConfig() DERPConfig {
 	serverEnabled := viper.GetBool("derp.server.enabled")
-	serverRegionID := viper.GetInt("derp.server.region_id")
+	serverRegionID := viper.GetInt64("derp.server.region_id")
 	serverRegionCode := viper.GetString("derp.server.region_code")
 	serverRegionName := viper.GetString("derp.server.region_name")
 	serverVerifyClients := viper.GetBool("derp.server.verify_clients")
@@ -690,8 +752,8 @@ func derpConfig() DERPConfig {
 
 	urlStrs := viper.GetStringSlice("derp.urls")
 
-	urls := make([]url.URL, len(urlStrs))
-	for index, urlStr := range urlStrs {
+	urls := make([]url.URL, 0, len(urlStrs))
+	for _, urlStr := range urlStrs {
 		urlAddr, err := url.Parse(urlStr)
 		if err != nil {
 			log.Error().
@@ -699,9 +761,11 @@ func derpConfig() DERPConfig {
 				Str("url", urlStr).
 				Err(err).
 				Msg("Failed to parse url, ignoring...")
+
+			continue
 		}
 
-		urls[index] = *urlAddr
+		urls = append(urls, *urlAddr)
 	}
 
 	paths := viper.GetStringSlice("derp.paths")
@@ -716,7 +780,7 @@ func derpConfig() DERPConfig {
 
 	return DERPConfig{
 		ServerEnabled:                      serverEnabled,
-		ServerRegionID:                     serverRegionID,
+		ServerRegionID:                     tailcfg.DERPRegionID(serverRegionID),
 		ServerRegionCode:                   serverRegionCode,
 		ServerRegionName:                   serverRegionName,
 		ServerVerifyClients:                serverVerifyClients,
@@ -867,15 +931,15 @@ func dns() (DNSConfig, error) {
 	return dns, nil
 }
 
-// globalResolvers returns the global DNS resolvers
-// defined in the config file.
+// parseResolvers converts nameserver strings into DNS resolvers.
 // If a nameserver is a valid IP, it will be used as a regular resolver.
 // If a nameserver is a valid URL, it will be used as a DoH resolver.
 // If a nameserver is neither a valid URL nor a valid IP, it will be ignored.
-func (d *DNSConfig) globalResolvers() []*dnstype.Resolver {
+// When domain is non-empty, it is included in the warning for invalid entries.
+func parseResolvers(nameservers []string, domain string) []*dnstype.Resolver {
 	var resolvers []*dnstype.Resolver
 
-	for _, nsStr := range d.Nameservers.Global {
+	for _, nsStr := range nameservers {
 		if _, err := netip.ParseAddr(nsStr); err == nil { //nolint:noinlineerr
 			resolvers = append(resolvers, &dnstype.Resolver{
 				Addr: nsStr,
@@ -892,43 +956,29 @@ func (d *DNSConfig) globalResolvers() []*dnstype.Resolver {
 			continue
 		}
 
-		log.Warn().Str("nameserver", nsStr).Msg("invalid global nameserver, ignoring")
+		e := log.Warn().Str("nameserver", nsStr)
+		if domain != "" {
+			e = e.Str("domain", domain)
+		}
+
+		e.Msg("invalid nameserver, ignoring")
 	}
 
 	return resolvers
 }
 
+// globalResolvers returns the global DNS resolvers
+// defined in the config file.
+func (d *DNSConfig) globalResolvers() []*dnstype.Resolver {
+	return parseResolvers(d.Nameservers.Global, "")
+}
+
 // splitResolvers returns a map of domain to DNS resolvers.
-// If a nameserver is a valid IP, it will be used as a regular resolver.
-// If a nameserver is a valid URL, it will be used as a DoH resolver.
-// If a nameserver is neither a valid URL nor a valid IP, it will be ignored.
 func (d *DNSConfig) splitResolvers() map[string][]*dnstype.Resolver {
 	routes := make(map[string][]*dnstype.Resolver)
 
 	for domain, nameservers := range d.Nameservers.Split {
-		var resolvers []*dnstype.Resolver
-
-		for _, nsStr := range nameservers {
-			if _, err := netip.ParseAddr(nsStr); err == nil { //nolint:noinlineerr
-				resolvers = append(resolvers, &dnstype.Resolver{
-					Addr: nsStr,
-				})
-
-				continue
-			}
-
-			if _, err := url.Parse(nsStr); err == nil { //nolint:noinlineerr
-				resolvers = append(resolvers, &dnstype.Resolver{
-					Addr: nsStr,
-				})
-
-				continue
-			}
-
-			log.Warn().Str("nameserver", nsStr).Str("domain", domain).Msg("invalid split dns nameserver, ignoring")
-		}
-
-		routes[domain] = resolvers
+		routes[domain] = parseResolvers(nameservers, domain)
 	}
 
 	return routes
@@ -943,7 +993,7 @@ func dnsToTailcfgDNS(dns DNSConfig) *tailcfg.DNSConfig {
 
 	cfg.Proxied = dns.MagicDNS
 
-	cfg.ExtraRecords = dns.ExtraRecords
+	cfg.ExtraRecords = lowercaseRecordNames(dns.ExtraRecords)
 	if dns.OverrideLocalDNS {
 		cfg.Resolvers = dns.globalResolvers()
 	} else {
@@ -991,43 +1041,49 @@ func warnBanner(lines []string) {
 	log.Warn().Msg(b.String())
 }
 
-func prefixV4() (*netip.Prefix, bool, error) {
-	prefixV4Str := viper.GetString("prefixes.v4")
+func parsePrefixConfig(key string, standardRange netip.Prefix, family string) (*netip.Prefix, bool, error) {
+	s := viper.GetString(key)
 
-	if prefixV4Str == "" {
+	if s == "" {
 		return nil, false, nil
 	}
 
-	prefixV4, err := netip.ParsePrefix(prefixV4Str)
+	prefix, err := netip.ParsePrefix(s)
 	if err != nil {
-		return nil, false, fmt.Errorf("parsing IPv4 prefix from config: %w", err)
+		return nil, false, fmt.Errorf("parsing %s prefix from config: %w", family, err)
 	}
 
 	builder := netipx.IPSetBuilder{}
-	builder.AddPrefix(tsaddr.CGNATRange())
+	builder.AddPrefix(standardRange)
 
 	ipSet, _ := builder.IPSet()
 
-	return &prefixV4, !ipSet.ContainsPrefix(prefixV4), nil
+	return &prefix, !ipSet.ContainsPrefix(prefix), nil
 }
 
-func prefixV6() (*netip.Prefix, bool, error) {
-	prefixV6Str := viper.GetString("prefixes.v6")
-
-	if prefixV6Str == "" {
-		return nil, false, nil
+// trustedProxies rejects 0.0.0.0/0 and ::/0 because they defeat the
+// peer-trust gate and almost always indicate misconfiguration.
+func trustedProxies() ([]netip.Prefix, error) {
+	raw := viper.GetStringSlice("trusted_proxies")
+	if len(raw) == 0 {
+		return nil, nil
 	}
 
-	prefixV6, err := netip.ParsePrefix(prefixV6Str)
-	if err != nil {
-		return nil, false, fmt.Errorf("parsing IPv6 prefix from config: %w", err)
+	out := make([]netip.Prefix, 0, len(raw))
+	for i, s := range raw {
+		p, err := netip.ParsePrefix(s)
+		if err != nil {
+			return nil, fmt.Errorf("trusted_proxies[%d] %q: %w", i, s, err)
+		}
+
+		if p.Bits() == 0 {
+			return nil, fmt.Errorf("trusted_proxies[%d] %q: %w", i, s, errTrustedProxyZeroRange)
+		}
+
+		out = append(out, p.Masked())
 	}
 
-	builder := netipx.IPSetBuilder{}
-	builder.AddPrefix(tsaddr.TailscaleULARange())
-	ipSet, _ := builder.IPSet()
-
-	return &prefixV6, !ipSet.ContainsPrefix(prefixV6), nil
+	return out, nil
 }
 
 // LoadCLIConfig returns the needed configuration for the CLI client
@@ -1059,12 +1115,17 @@ func LoadServerConfig() (*Config, error) {
 	logConfig := logConfig()
 	zerolog.SetGlobalLevel(logConfig.Level)
 
-	prefix4, v4NonStandard, err := prefixV4()
+	prefix4, v4NonStandard, err := parsePrefixConfig("prefixes.v4", tsaddr.CGNATRange(), "IPv4")
 	if err != nil {
 		return nil, err
 	}
 
-	prefix6, v6NonStandard, err := prefixV6()
+	prefix6, v6NonStandard, err := parsePrefixConfig("prefixes.v6", tsaddr.TailscaleULARange(), "IPv6")
+	if err != nil {
+		return nil, err
+	}
+
+	trusted, err := trustedProxies()
 	if err != nil {
 		return nil, err
 	}
@@ -1120,7 +1181,6 @@ func LoadServerConfig() (*Config, error) {
 
 	derpConfig := derpConfig()
 	logTailConfig := logtailConfig()
-	randomizeClientPort := viper.GetBool("randomize_client_port")
 
 	oidcClientSecret := viper.GetString("oidc.client_secret")
 
@@ -1158,8 +1218,7 @@ func LoadServerConfig() (*Config, error) {
 		ServerURL:          serverURL,
 		Addr:               viper.GetString("listen_addr"),
 		MetricsAddr:        viper.GetString("metrics_listen_addr"),
-		GRPCAddr:           viper.GetString("grpc_listen_addr"),
-		GRPCAllowInsecure:  viper.GetBool("grpc_allow_insecure"),
+		TrustedProxies:     trusted,
 		DisableUpdateCheck: false,
 
 		PrefixV4:     prefix4,
@@ -1184,6 +1243,10 @@ func LoadServerConfig() (*Config, error) {
 					ProbeTimeout:  viper.GetDuration("node.routes.ha.probe_timeout"),
 				},
 			},
+		},
+
+		PreAuthKeys: PreAuthKeysConfig{
+			RevokedRetention: viper.GetDuration("preauth_keys.revoked_retention"),
 		},
 
 		Database: databaseConfig(),
@@ -1219,10 +1282,12 @@ func LoadServerConfig() (*Config, error) {
 			},
 		},
 
-		LogTail:             logTailConfig,
-		RandomizeClientPort: randomizeClientPort,
+		LogTail: logTailConfig,
 		Taildrop: TaildropConfig{
 			Enabled: viper.GetBool("taildrop.enabled"),
+		},
+		AutoUpdate: AutoUpdateConfig{
+			Enabled: viper.GetBool("auto_update.enabled"),
 		},
 
 		Policy: policyConfig(),
@@ -1274,48 +1339,16 @@ func isSafeServerURL(serverURL, baseDomain string) error {
 		return errServerURLSame
 	}
 
-	serverDomainParts := strings.Split(server.Host, ".")
-	baseDomainParts := strings.Split(baseDomain, ".")
-
-	if len(serverDomainParts) <= len(baseDomainParts) {
-		return nil
+	if strings.HasSuffix(server.Hostname(), "."+baseDomain) {
+		return errServerURLSuffix
 	}
 
-	s := len(serverDomainParts)
-
-	b := len(baseDomainParts)
-	for i := range baseDomainParts {
-		if serverDomainParts[s-i-1] != baseDomainParts[b-i-1] {
-			return nil
-		}
-	}
-
-	return errServerURLSuffix
+	return nil
 }
 
 type deprecator struct {
 	warns  set.Set[string]
 	fatals set.Set[string]
-}
-
-// warnWithAlias will register an alias between the newKey and the oldKey,
-// and log a deprecation warning if the oldKey is set.
-//
-//nolint:unused
-func (d *deprecator) warnWithAlias(newKey, oldKey string) {
-	// NOTE: RegisterAlias is called with NEW KEY -> OLD KEY
-	viper.RegisterAlias(newKey, oldKey)
-
-	if viper.IsSet(oldKey) {
-		d.warns.Add(
-			fmt.Sprintf(
-				"The %q configuration key is deprecated. Please use %q instead. %q will be removed in the future.",
-				oldKey,
-				newKey,
-				oldKey,
-			),
-		)
-	}
 }
 
 // fatal deprecates and adds an entry to the fatal list of options if the oldKey is set.
@@ -1325,6 +1358,22 @@ func (d *deprecator) fatal(oldKey string) {
 			fmt.Sprintf(
 				"The %q configuration key has been removed. Please see the changelog for more details.",
 				oldKey,
+			),
+		)
+	}
+}
+
+// fatalWithHint behaves like fatal but appends a remediation pointer to
+// the message so operators see exactly what to do without leaving the
+// terminal. Use it when the removed key has a clean replacement on the
+// policy side.
+func (d *deprecator) fatalWithHint(oldKey, hint string) {
+	if viper.IsSet(oldKey) {
+		d.fatals.Add(
+			fmt.Sprintf(
+				"The %q configuration key has been removed. %s",
+				oldKey,
+				hint,
 			),
 		)
 	}
@@ -1378,20 +1427,6 @@ func (d *deprecator) warnNoAlias(newKey, oldKey string) {
 	}
 }
 
-// warn deprecates and adds an entry to the warn list of options if the oldKey is set.
-//
-//nolint:unused
-func (d *deprecator) warn(oldKey string) {
-	if viper.IsSet(oldKey) {
-		d.warns.Add(
-			fmt.Sprintf(
-				"The %q configuration key is deprecated and has been removed. Please see the changelog for more details.",
-				oldKey,
-			),
-		)
-	}
-}
-
 func (d *deprecator) String() string {
 	var b strings.Builder
 
@@ -1412,4 +1447,50 @@ func (d *deprecator) Log() {
 	} else if len(d.warns) > 0 {
 		log.Warn().Msg("\n" + d.String())
 	}
+}
+
+// tailcfgDNSMu guards concurrent access to the mutable ExtraRecords of
+// [Config.TailcfgDNSConfig] between the extra-records file watcher (writer)
+// and the per-client map builds that clone it (readers). It is a package-level
+// lock so [Config] stays freely copyable during construction.
+var tailcfgDNSMu sync.RWMutex
+
+// CloneTailcfgDNSConfig returns a deep copy of [Config.TailcfgDNSConfig], or
+// nil if none is set. Safe for concurrent use with [Config.SetExtraRecords].
+func (c *Config) CloneTailcfgDNSConfig() *tailcfg.DNSConfig {
+	tailcfgDNSMu.RLock()
+	defer tailcfgDNSMu.RUnlock()
+
+	if c.TailcfgDNSConfig == nil {
+		return nil
+	}
+
+	return c.TailcfgDNSConfig.Clone()
+}
+
+// SetExtraRecords replaces the ExtraRecords of [Config.TailcfgDNSConfig]. Safe
+// for concurrent use with [Config.CloneTailcfgDNSConfig].
+func (c *Config) SetExtraRecords(records []tailcfg.DNSRecord) {
+	tailcfgDNSMu.Lock()
+	defer tailcfgDNSMu.Unlock()
+
+	if c.TailcfgDNSConfig != nil {
+		c.TailcfgDNSConfig.ExtraRecords = lowercaseRecordNames(records)
+	}
+}
+
+// lowercaseRecordNames normalizes DNS record names to lowercase, as DNS names
+// are case-insensitive and clients match extra records by exact name.
+func lowercaseRecordNames(records []tailcfg.DNSRecord) []tailcfg.DNSRecord {
+	if len(records) == 0 {
+		return records
+	}
+
+	normalized := make([]tailcfg.DNSRecord, len(records))
+	for i, record := range records {
+		record.Name = strings.ToLower(record.Name)
+		normalized[i] = record
+	}
+
+	return normalized
 }

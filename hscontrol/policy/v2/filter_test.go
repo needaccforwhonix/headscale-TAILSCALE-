@@ -15,8 +15,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go4.org/netipx"
-	"gorm.io/gorm"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/peercap"
 )
 
 // aliasWithPorts creates an AliasWithPorts structure from an alias and ports.
@@ -29,7 +29,7 @@ func aliasWithPorts(alias Alias, ports ...tailcfg.PortRange) AliasWithPorts {
 
 func TestParsing(t *testing.T) {
 	users := types.Users{
-		{Model: gorm.Model{ID: 1}, Name: "testuser"},
+		{ID: 1, Name: "testuser"},
 	}
 	tests := []struct {
 		name    string
@@ -368,7 +368,7 @@ func TestParsing(t *testing.T) {
 				return
 			}
 
-			rules, err := pol.compileFilterRules(
+			rules := pol.compileFilterRules(
 				users,
 				types.Nodes{
 					&types.Node{
@@ -381,12 +381,6 @@ func TestParsing(t *testing.T) {
 					},
 				}.ViewSlice())
 
-			if (err != nil) != tt.wantErr {
-				t.Errorf("parsing() error = %v, wantErr %v", err, tt.wantErr)
-
-				return
-			}
-
 			if diff := cmp.Diff(tt.want, rules); diff != "" {
 				t.Errorf("parsing() unexpected result (-want +got):\n%s", diff)
 			}
@@ -396,8 +390,8 @@ func TestParsing(t *testing.T) {
 
 func TestCompileSSHPolicy_UserMapping(t *testing.T) {
 	users := types.Users{
-		{Name: "user1", Model: gorm.Model{ID: 1}},
-		{Name: "user2", Model: gorm.Model{ID: 2}},
+		{Name: "user1", ID: 1},
+		{Name: "user2", ID: 2},
 	}
 
 	// Create test nodes - use tagged nodes as SSH destinations
@@ -644,10 +638,10 @@ func TestCompileSSHPolicy_UserMapping(t *testing.T) {
 
 func TestCompileSSHPolicy_LocalpartMapping(t *testing.T) {
 	users := types.Users{
-		{Name: "alice", Email: "alice@example.com", Model: gorm.Model{ID: 1}},
-		{Name: "bob", Email: "bob@example.com", Model: gorm.Model{ID: 2}},
-		{Name: "charlie", Email: "charlie@other.com", Model: gorm.Model{ID: 3}},
-		{Name: "dave", Model: gorm.Model{ID: 4}}, // CLI user, no email
+		{Name: "alice", Email: "alice@example.com", ID: 1},
+		{Name: "bob", Email: "bob@example.com", ID: 2},
+		{Name: "charlie", Email: "charlie@other.com", ID: 3},
+		{Name: "dave", ID: 4}, // CLI user, no email
 	}
 
 	nodeTaggedServer := types.Node{
@@ -842,10 +836,10 @@ func TestCompileSSHPolicy_LocalpartMapping(t *testing.T) {
 		{
 			name: "localpart with special chars in email",
 			users: types.Users{
-				{Name: "dave+sshuser", Email: "dave+sshuser@example.com", Model: gorm.Model{ID: 10}},
+				{Name: "dave+sshuser", Email: "dave+sshuser@example.com", ID: 10},
 			},
 			nodes: func() types.Nodes {
-				specialUser := types.User{Name: "dave+sshuser", Email: "dave+sshuser@example.com", Model: gorm.Model{ID: 10}}
+				specialUser := types.User{Name: "dave+sshuser", Email: "dave+sshuser@example.com", ID: 10}
 				n := types.Node{
 					Hostname: "special-device",
 					IPv4:     createAddr("100.64.0.10"),
@@ -886,10 +880,10 @@ func TestCompileSSHPolicy_LocalpartMapping(t *testing.T) {
 		{
 			name: "localpart excludes CLI users without email",
 			users: types.Users{
-				{Name: "dave", Model: gorm.Model{ID: 4}},
+				{Name: "dave", ID: 4},
 			},
 			nodes: func() types.Nodes {
-				cliUser := types.User{Name: "dave", Model: gorm.Model{ID: 4}}
+				cliUser := types.User{Name: "dave", ID: 4}
 				n := types.Node{
 					Hostname: "dave-cli-device",
 					IPv4:     createAddr("100.64.0.5"),
@@ -1011,8 +1005,8 @@ func TestCompileSSHPolicy_LocalpartMapping(t *testing.T) {
 
 func TestCompileSSHPolicy_CheckAction(t *testing.T) {
 	users := types.Users{
-		{Name: "user1", Model: gorm.Model{ID: 1}},
-		{Name: "user2", Model: gorm.Model{ID: 2}},
+		{Name: "user1", ID: 1},
+		{Name: "user2", ID: 2},
 	}
 
 	// Use tagged nodes for SSH user mapping tests
@@ -1071,7 +1065,7 @@ func TestCompileSSHPolicy_CheckAction(t *testing.T) {
 	assert.False(t, rule.Action.Reject)
 	assert.NotEmpty(t, rule.Action.HoldAndDelegate)
 	assert.Contains(t, rule.Action.HoldAndDelegate, "/machine/ssh/action/")
-	assert.Equal(t, 24*time.Hour, rule.Action.SessionDuration)
+	assert.Equal(t, time.Duration(0), rule.Action.SessionDuration)
 
 	// Verify check params are NOT encoded in the URL (looked up server-side).
 	assert.NotContains(t, rule.Action.HoldAndDelegate, "check_explicit")
@@ -1083,8 +1077,8 @@ func TestCompileSSHPolicy_CheckAction(t *testing.T) {
 // the accept rule appears first in the policy definition.
 func TestCompileSSHPolicy_CheckBeforeAcceptOrdering(t *testing.T) {
 	users := types.Users{
-		{Name: "user1", Model: gorm.Model{ID: 1}},
-		{Name: "user2", Model: gorm.Model{ID: 2}},
+		{Name: "user1", ID: 1},
+		{Name: "user2", ID: 2},
 	}
 
 	nodeTaggedServer := types.Node{
@@ -1159,8 +1153,8 @@ func TestCompileSSHPolicy_CheckBeforeAcceptOrdering(t *testing.T) {
 func TestSSHIntegrationReproduction(t *testing.T) {
 	// Create users matching the integration test
 	users := types.Users{
-		{Name: "user1", Model: gorm.Model{ID: 1}},
-		{Name: "user2", Model: gorm.Model{ID: 2}},
+		{Name: "user1", ID: 1},
+		{Name: "user2", ID: 2},
 	}
 
 	// Create simple nodes for testing
@@ -1224,7 +1218,7 @@ func TestSSHIntegrationReproduction(t *testing.T) {
 // to JSON and that the sshUsers field is not empty.
 func TestSSHJSONSerialization(t *testing.T) {
 	users := types.Users{
-		{Name: "user1", Model: gorm.Model{ID: 1}},
+		{Name: "user1", ID: 1},
 	}
 
 	uid := uint(1)
@@ -1284,8 +1278,8 @@ func TestSSHJSONSerialization(t *testing.T) {
 
 func TestCompileFilterRulesForNodeWithAutogroupSelf(t *testing.T) {
 	users := types.Users{
-		{Model: gorm.Model{ID: 1}, Name: "user1"},
-		{Model: gorm.Model{ID: 2}, Name: "user2"},
+		{ID: 1, Name: "user1"},
+		{ID: 2, Name: "user2"},
 	}
 
 	nodes := types.Nodes{
@@ -1340,10 +1334,7 @@ func TestCompileFilterRulesForNodeWithAutogroupSelf(t *testing.T) {
 	// Test compilation for user1's first node
 	node1 := nodes[0].View()
 
-	rules, err := policy2.compileFilterRulesForNode(users, node1, nodes.ViewSlice())
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	rules := policy2.compileFilterRulesForNode(users, node1, nodes.ViewSlice())
 
 	if len(rules) != 1 {
 		t.Fatalf("expected 1 rule, got %d", len(rules))
@@ -1448,8 +1439,8 @@ func TestCompileFilterRulesForNodeWithAutogroupSelf(t *testing.T) {
 // It also verifies that tag-to-tag rules work correctly.
 func TestTagUserMutualExclusivity(t *testing.T) {
 	users := types.Users{
-		{Model: gorm.Model{ID: 1}, Name: "user1"},
-		{Model: gorm.Model{ID: 2}, Name: "user2"},
+		{ID: 1, Name: "user1"},
+		{ID: 2, Name: "user2"},
 	}
 
 	nodes := types.Nodes{
@@ -1501,8 +1492,7 @@ func TestTagUserMutualExclusivity(t *testing.T) {
 	// matching the production pipeline in filterForNodeLocked.
 	userNode := nodes[0].View()
 
-	compiled, err := pol.compileFilterRulesForNode(users, userNode, nodes.ViewSlice())
-	require.NoError(t, err)
+	compiled := pol.compileFilterRulesForNode(users, userNode, nodes.ViewSlice())
 
 	userRules := policyutil.ReduceFilterRules(userNode, compiled)
 
@@ -1524,8 +1514,7 @@ func TestTagUserMutualExclusivity(t *testing.T) {
 	// Tag:database should receive the tag:server → tag:database rule after reduction.
 	dbNode := nodes[3].View()
 
-	compiled, err = pol.compileFilterRulesForNode(users, dbNode, nodes.ViewSlice())
-	require.NoError(t, err)
+	compiled = pol.compileFilterRulesForNode(users, dbNode, nodes.ViewSlice())
 
 	dbRules := policyutil.ReduceFilterRules(dbNode, compiled)
 
@@ -1552,8 +1541,8 @@ func TestTagUserMutualExclusivity(t *testing.T) {
 // are valid and should produce filter rules.
 func TestUserToTagCrossIdentityGrant(t *testing.T) {
 	users := types.Users{
-		{Model: gorm.Model{ID: 1}, Name: "user1"},
-		{Model: gorm.Model{ID: 2}, Name: "user2"},
+		{ID: 1, Name: "user1"},
+		{ID: 2, Name: "user2"},
 	}
 
 	nodes := types.Nodes{
@@ -1596,8 +1585,7 @@ func TestUserToTagCrossIdentityGrant(t *testing.T) {
 	// user1's IP as source.
 	taggedNode := nodes[2].View()
 
-	compiled, err := pol.compileFilterRulesForNode(users, taggedNode, nodes.ViewSlice())
-	require.NoError(t, err)
+	compiled := pol.compileFilterRulesForNode(users, taggedNode, nodes.ViewSlice())
 
 	rules := policyutil.ReduceFilterRules(taggedNode, compiled)
 
@@ -1638,8 +1626,8 @@ func TestAutogroupTagged(t *testing.T) {
 	t.Parallel()
 
 	users := types.Users{
-		{Model: gorm.Model{ID: 1}, Name: "user1"},
-		{Model: gorm.Model{ID: 2}, Name: "user2"},
+		{ID: 1, Name: "user1"},
+		{ID: 2, Name: "user2"},
 	}
 
 	nodes := types.Nodes{
@@ -1735,8 +1723,7 @@ func TestAutogroupTagged(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			rules, err := policy.compileFilterRulesForNode(users, tt.sourceNode, nodes.ViewSlice())
-			require.NoError(t, err)
+			rules := policy.compileFilterRulesForNode(users, tt.sourceNode, nodes.ViewSlice())
 
 			// Verify all expected destinations are reachable
 			for _, expectedDest := range tt.shouldReach {
@@ -1791,8 +1778,8 @@ func TestAutogroupSelfInSourceIsRejected(t *testing.T) {
 // are allowed (and only if they match the target user).
 func TestAutogroupSelfWithSpecificUserSource(t *testing.T) {
 	users := types.Users{
-		{Model: gorm.Model{ID: 1}, Name: "user1"},
-		{Model: gorm.Model{ID: 2}, Name: "user2"},
+		{ID: 1, Name: "user1"},
+		{ID: 2, Name: "user2"},
 	}
 
 	nodes := types.Nodes{
@@ -1819,8 +1806,7 @@ func TestAutogroupSelfWithSpecificUserSource(t *testing.T) {
 
 	// For user1's node: sources should be user1's devices
 	node1 := nodes[0].View()
-	rules, err := policy.compileFilterRulesForNode(users, node1, nodes.ViewSlice())
-	require.NoError(t, err)
+	rules := policy.compileFilterRulesForNode(users, node1, nodes.ViewSlice())
 	require.Len(t, rules, 1)
 
 	expectedSourceIPs := []string{"100.64.0.1", "100.64.0.2"}
@@ -1850,8 +1836,7 @@ func TestAutogroupSelfWithSpecificUserSource(t *testing.T) {
 	assert.ElementsMatch(t, expectedDestIPs, actualDestIPs)
 
 	node2 := nodes[2].View()
-	rules2, err := policy.compileFilterRulesForNode(users, node2, nodes.ViewSlice())
-	require.NoError(t, err)
+	rules2 := policy.compileFilterRulesForNode(users, node2, nodes.ViewSlice())
 	assert.Empty(t, rules2, "user2's node should have no rules (user1@ devices can't match user2's self)")
 }
 
@@ -1860,9 +1845,9 @@ func TestAutogroupSelfWithSpecificUserSource(t *testing.T) {
 // as the target are allowed.
 func TestAutogroupSelfWithGroupSource(t *testing.T) {
 	users := types.Users{
-		{Model: gorm.Model{ID: 1}, Name: "user1"},
-		{Model: gorm.Model{ID: 2}, Name: "user2"},
-		{Model: gorm.Model{ID: 3}, Name: "user3"},
+		{ID: 1, Name: "user1"},
+		{ID: 2, Name: "user2"},
+		{ID: 3, Name: "user3"},
 	}
 
 	nodes := types.Nodes{
@@ -1893,8 +1878,7 @@ func TestAutogroupSelfWithGroupSource(t *testing.T) {
 
 	// (group:admins has user1+user2, but autogroup:self filters to same user)
 	node1 := nodes[0].View()
-	rules, err := policy.compileFilterRulesForNode(users, node1, nodes.ViewSlice())
-	require.NoError(t, err)
+	rules := policy.compileFilterRulesForNode(users, node1, nodes.ViewSlice())
 	require.Len(t, rules, 1)
 
 	expectedSrcIPs := []string{"100.64.0.1", "100.64.0.2"}
@@ -1916,8 +1900,7 @@ func TestAutogroupSelfWithGroupSource(t *testing.T) {
 	}
 
 	node3 := nodes[4].View()
-	rules3, err := policy.compileFilterRulesForNode(users, node3, nodes.ViewSlice())
-	require.NoError(t, err)
+	rules3 := policy.compileFilterRulesForNode(users, node3, nodes.ViewSlice())
 	assert.Empty(t, rules3, "user3 should have no rules")
 }
 
@@ -1931,8 +1914,8 @@ func createAddr(ip string) *netip.Addr {
 // with autogroup:self in destinations.
 func TestSSHWithAutogroupSelfInDestination(t *testing.T) {
 	users := types.Users{
-		{Model: gorm.Model{ID: 1}, Name: "user1"},
-		{Model: gorm.Model{ID: 2}, Name: "user2"},
+		{ID: 1, Name: "user1"},
+		{ID: 2, Name: "user2"},
 	}
 
 	nodes := types.Nodes{
@@ -2013,8 +1996,8 @@ func TestSSHWithAutogroupSelfInDestination(t *testing.T) {
 // can SSH (and only if they match the target user).
 func TestSSHWithAutogroupSelfAndSpecificUser(t *testing.T) {
 	users := types.Users{
-		{Model: gorm.Model{ID: 1}, Name: "user1"},
-		{Model: gorm.Model{ID: 2}, Name: "user2"},
+		{ID: 1, Name: "user1"},
+		{ID: 2, Name: "user2"},
 	}
 
 	nodes := types.Nodes{
@@ -2068,9 +2051,9 @@ func TestSSHWithAutogroupSelfAndSpecificUser(t *testing.T) {
 // TestSSHWithAutogroupSelfAndGroup verifies SSH with group sources and autogroup:self destinations.
 func TestSSHWithAutogroupSelfAndGroup(t *testing.T) {
 	users := types.Users{
-		{Model: gorm.Model{ID: 1}, Name: "user1"},
-		{Model: gorm.Model{ID: 2}, Name: "user2"},
-		{Model: gorm.Model{ID: 3}, Name: "user3"},
+		{ID: 1, Name: "user1"},
+		{ID: 2, Name: "user2"},
+		{ID: 3, Name: "user3"},
 	}
 
 	nodes := types.Nodes{
@@ -2129,7 +2112,7 @@ func TestSSHWithAutogroupSelfAndGroup(t *testing.T) {
 // are excluded from both sources and destinations when autogroup:self is used.
 func TestSSHWithAutogroupSelfExcludesTaggedDevices(t *testing.T) {
 	users := types.Users{
-		{Model: gorm.Model{ID: 1}, Name: "user1"},
+		{ID: 1, Name: "user1"},
 	}
 
 	nodes := types.Nodes{
@@ -2190,8 +2173,8 @@ func TestSSHWithAutogroupSelfExcludesTaggedDevices(t *testing.T) {
 // autogroup:self filtering only applies to autogroup:self destinations, not others.
 func TestSSHWithAutogroupSelfAndMixedDestinations(t *testing.T) {
 	users := types.Users{
-		{Model: gorm.Model{ID: 1}, Name: "user1"},
-		{Model: gorm.Model{ID: 2}, Name: "user2"},
+		{ID: 1, Name: "user1"},
+		{ID: 2, Name: "user2"},
 	}
 
 	nodes := types.Nodes{
@@ -2263,9 +2246,9 @@ func TestSSHWithAutogroupSelfAndMixedDestinations(t *testing.T) {
 // registered nodes.
 func TestAutogroupSelfWithNonExistentUserInGroup(t *testing.T) {
 	users := types.Users{
-		{Model: gorm.Model{ID: 1}, Name: "superadmin"},
-		{Model: gorm.Model{ID: 2}, Name: "admin"},
-		{Model: gorm.Model{ID: 3}, Name: "direction"},
+		{ID: 1, Name: "superadmin"},
+		{ID: 2, Name: "admin"},
+		{ID: 3, Name: "direction"},
 	}
 
 	nodes := types.Nodes{
@@ -2366,8 +2349,7 @@ func TestAutogroupSelfWithNonExistentUserInGroup(t *testing.T) {
 	// Test superadmin's device: should have rules with tag:common, tag:tech, tag:privileged destinations
 	// and superadmin's IP should appear in sources (partial resolution of group:superadmin works)
 	superadminNode := nodes[0].View()
-	superadminRules, err := policy.compileFilterRulesForNode(users, superadminNode, nodes.ViewSlice())
-	require.NoError(t, err)
+	superadminRules := policy.compileFilterRulesForNode(users, superadminNode, nodes.ViewSlice())
 	assert.True(t, containsIP(superadminRules, "100.64.0.10"), "rules should include tag:common server")
 	assert.True(t, containsIP(superadminRules, "100.64.0.11"), "rules should include tag:tech server")
 	assert.True(t, containsIP(superadminRules, "100.64.0.12"), "rules should include tag:privileged server")
@@ -2383,8 +2365,7 @@ func TestAutogroupSelfWithNonExistentUserInGroup(t *testing.T) {
 	// partial result to be discarded via `continue`. With the fix, superadmin's IPs
 	// from group:superadmin are retained alongside admin's IPs from group:admin.
 	adminNode := nodes[1].View()
-	adminRules, err := policy.compileFilterRulesForNode(users, adminNode, nodes.ViewSlice())
-	require.NoError(t, err)
+	adminRules := policy.compileFilterRulesForNode(users, adminNode, nodes.ViewSlice())
 
 	// Rule 1 sources: [group:superadmin, group:admin, group:direction]
 	// Without fix: group:superadmin discarded -> only admin + direction IPs in sources
@@ -2398,8 +2379,7 @@ func TestAutogroupSelfWithNonExistentUserInGroup(t *testing.T) {
 
 	// Test direction's device: similar to admin, verifies group:direction sources work
 	directionNode := nodes[2].View()
-	directionRules, err := policy.compileFilterRulesForNode(users, directionNode, nodes.ViewSlice())
-	require.NoError(t, err)
+	directionRules := policy.compileFilterRulesForNode(users, directionNode, nodes.ViewSlice())
 	assert.True(t, containsIP(directionRules, "100.64.0.10"),
 		"direction rules should include tag:common server")
 	assert.True(t, containsSrcIP(directionRules, "100.64.0.3"),
@@ -2620,7 +2600,7 @@ func TestMergeFilterRules(t *testing.T) {
 
 func TestCompileSSHPolicy_CheckPeriodVariants(t *testing.T) {
 	users := types.Users{
-		{Name: "user1", Model: gorm.Model{ID: 1}},
+		{Name: "user1", ID: 1},
 	}
 
 	node := types.Node{
@@ -2632,25 +2612,24 @@ func TestCompileSSHPolicy_CheckPeriodVariants(t *testing.T) {
 
 	nodes := types.Nodes{&node}
 
+	// SaaS always sends SessionDuration=0 in the wire format
+	// regardless of checkPeriod. The check period is resolved
+	// server-side, not embedded in the SSHAction.
 	tests := []struct {
-		name         string
-		checkPeriod  *SSHCheckPeriod
-		wantDuration time.Duration
+		name        string
+		checkPeriod *SSHCheckPeriod
 	}{
 		{
-			name:         "nil period defaults to 12h",
-			checkPeriod:  nil,
-			wantDuration: SSHCheckPeriodDefault,
+			name:        "nil period",
+			checkPeriod: nil,
 		},
 		{
-			name:         "always period uses 0",
-			checkPeriod:  &SSHCheckPeriod{Always: true},
-			wantDuration: 0,
+			name:        "always period",
+			checkPeriod: &SSHCheckPeriod{Always: true},
 		},
 		{
-			name:         "explicit 2h",
-			checkPeriod:  &SSHCheckPeriod{Duration: 2 * time.Hour},
-			wantDuration: 2 * time.Hour,
+			name:        "explicit 2h",
+			checkPeriod: &SSHCheckPeriod{Duration: 2 * time.Hour},
 		},
 	}
 
@@ -2682,7 +2661,7 @@ func TestCompileSSHPolicy_CheckPeriodVariants(t *testing.T) {
 			require.Len(t, sshPolicy.Rules, 1)
 
 			rule := sshPolicy.Rules[0]
-			assert.Equal(t, tt.wantDuration, rule.Action.SessionDuration)
+			assert.Equal(t, time.Duration(0), rule.Action.SessionDuration)
 			// Check params must NOT be in the URL; they are
 			// resolved server-side via SSHCheckParams.
 			assert.NotContains(t, rule.Action.HoldAndDelegate, "check_explicit")
@@ -2776,8 +2755,8 @@ func TestIPSetToPrincipals(t *testing.T) {
 
 func TestSSHCheckParams(t *testing.T) {
 	users := types.Users{
-		{Name: "user1", Model: gorm.Model{ID: 1}},
-		{Name: "user2", Model: gorm.Model{ID: 2}},
+		{Name: "user1", ID: 1},
+		{Name: "user2", ID: 2},
 	}
 
 	nodeUser1 := types.Node{
@@ -2965,14 +2944,14 @@ func TestResolveLocalparts(t *testing.T) {
 		{
 			name:    "no entries",
 			entries: nil,
-			users:   types.Users{{Name: "alice", Email: "alice@example.com", Model: gorm.Model{ID: 1}}},
+			users:   types.Users{{Name: "alice", Email: "alice@example.com", ID: 1}},
 			want:    nil,
 		},
 		{
 			name:    "single match",
 			entries: []SSHUser{"localpart:*@example.com"},
 			users: types.Users{
-				{Name: "alice", Email: "alice@example.com", Model: gorm.Model{ID: 1}},
+				{Name: "alice", Email: "alice@example.com", ID: 1},
 			},
 			want: map[uint]string{1: "alice"},
 		},
@@ -2980,7 +2959,7 @@ func TestResolveLocalparts(t *testing.T) {
 			name:    "domain mismatch",
 			entries: []SSHUser{"localpart:*@other.com"},
 			users: types.Users{
-				{Name: "alice", Email: "alice@example.com", Model: gorm.Model{ID: 1}},
+				{Name: "alice", Email: "alice@example.com", ID: 1},
 			},
 			want: map[uint]string{},
 		},
@@ -2988,7 +2967,7 @@ func TestResolveLocalparts(t *testing.T) {
 			name:    "case insensitive domain",
 			entries: []SSHUser{"localpart:*@EXAMPLE.COM"},
 			users: types.Users{
-				{Name: "alice", Email: "alice@example.com", Model: gorm.Model{ID: 1}},
+				{Name: "alice", Email: "alice@example.com", ID: 1},
 			},
 			want: map[uint]string{1: "alice"},
 		},
@@ -2996,7 +2975,7 @@ func TestResolveLocalparts(t *testing.T) {
 			name:    "user without email skipped",
 			entries: []SSHUser{"localpart:*@example.com"},
 			users: types.Users{
-				{Name: "cli-user", Model: gorm.Model{ID: 1}},
+				{Name: "cli-user", ID: 1},
 			},
 			want: map[uint]string{},
 		},
@@ -3007,9 +2986,9 @@ func TestResolveLocalparts(t *testing.T) {
 				"localpart:*@other.com",
 			},
 			users: types.Users{
-				{Name: "alice", Email: "alice@example.com", Model: gorm.Model{ID: 1}},
-				{Name: "bob", Email: "bob@other.com", Model: gorm.Model{ID: 2}},
-				{Name: "charlie", Email: "charlie@nope.com", Model: gorm.Model{ID: 3}},
+				{Name: "alice", Email: "alice@example.com", ID: 1},
+				{Name: "bob", Email: "bob@other.com", ID: 2},
+				{Name: "charlie", Email: "charlie@nope.com", ID: 3},
 			},
 			want: map[uint]string{1: "alice", 2: "bob"},
 		},
@@ -3017,7 +2996,7 @@ func TestResolveLocalparts(t *testing.T) {
 			name:    "special chars in local part",
 			entries: []SSHUser{"localpart:*@example.com"},
 			users: types.Users{
-				{Name: "d", Email: "dave+ssh@example.com", Model: gorm.Model{ID: 1}},
+				{Name: "d", Email: "dave+ssh@example.com", ID: 1},
 			},
 			want: map[uint]string{1: "dave+ssh"},
 		},
@@ -3036,11 +3015,11 @@ func TestResolveLocalparts(t *testing.T) {
 func TestGroupSourcesByUser(t *testing.T) {
 	alice := types.User{
 		Name: "alice", Email: "alice@example.com",
-		Model: gorm.Model{ID: 1},
+		ID: 1,
 	}
 	bob := types.User{
 		Name: "bob", Email: "bob@example.com",
-		Model: gorm.Model{ID: 2},
+		ID: 2,
 	}
 
 	nodeAlice := types.Node{
@@ -3188,7 +3167,7 @@ func TestCompanionCapGrantRules(t *testing.T) {
 			dstIPStrings: []string{"100.64.0.1"},
 			srcPrefixes:  []netip.Prefix{mp("100.64.0.2/32")},
 			capMap: tailcfg.PeerCapMap{
-				tailcfg.PeerCapabilityTaildrive: {tailcfg.RawMessage(`{}`)},
+				peercap.Taildrive: {tailcfg.RawMessage(`{}`)},
 			},
 			want: []tailcfg.FilterRule{
 				{
@@ -3197,7 +3176,7 @@ func TestCompanionCapGrantRules(t *testing.T) {
 						{
 							Dsts: []netip.Prefix{mp("100.64.0.2/32")},
 							CapMap: tailcfg.PeerCapMap{
-								tailcfg.PeerCapabilityTaildriveSharer: nil,
+								peercap.TaildriveSharer: nil,
 							},
 						},
 					},
@@ -3209,7 +3188,7 @@ func TestCompanionCapGrantRules(t *testing.T) {
 			dstIPStrings: []string{"100.64.0.10"},
 			srcPrefixes:  []netip.Prefix{mp("100.64.0.20/32")},
 			capMap: tailcfg.PeerCapMap{
-				tailcfg.PeerCapabilityRelay: {tailcfg.RawMessage(`{}`)},
+				peercap.Relay: {tailcfg.RawMessage(`{}`)},
 			},
 			want: []tailcfg.FilterRule{
 				{
@@ -3218,7 +3197,7 @@ func TestCompanionCapGrantRules(t *testing.T) {
 						{
 							Dsts: []netip.Prefix{mp("100.64.0.20/32")},
 							CapMap: tailcfg.PeerCapMap{
-								tailcfg.PeerCapabilityRelayTarget: nil,
+								peercap.RelayTarget: nil,
 							},
 						},
 					},
@@ -3230,8 +3209,8 @@ func TestCompanionCapGrantRules(t *testing.T) {
 			dstIPStrings: []string{"100.64.0.1"},
 			srcPrefixes:  []netip.Prefix{mp("100.64.0.2/32")},
 			capMap: tailcfg.PeerCapMap{
-				tailcfg.PeerCapabilityRelay:     {tailcfg.RawMessage(`{}`)},
-				tailcfg.PeerCapabilityTaildrive: {tailcfg.RawMessage(`{}`)},
+				peercap.Relay:     {tailcfg.RawMessage(`{}`)},
+				peercap.Taildrive: {tailcfg.RawMessage(`{}`)},
 			},
 			want: []tailcfg.FilterRule{
 				{
@@ -3241,7 +3220,7 @@ func TestCompanionCapGrantRules(t *testing.T) {
 						{
 							Dsts: []netip.Prefix{mp("100.64.0.2/32")},
 							CapMap: tailcfg.PeerCapMap{
-								tailcfg.PeerCapabilityTaildriveSharer: nil,
+								peercap.TaildriveSharer: nil,
 							},
 						},
 					},
@@ -3252,7 +3231,7 @@ func TestCompanionCapGrantRules(t *testing.T) {
 						{
 							Dsts: []netip.Prefix{mp("100.64.0.2/32")},
 							CapMap: tailcfg.PeerCapMap{
-								tailcfg.PeerCapabilityRelayTarget: nil,
+								peercap.RelayTarget: nil,
 							},
 						},
 					},
@@ -3273,7 +3252,7 @@ func TestCompanionCapGrantRules(t *testing.T) {
 			dstIPStrings: []string{"100.64.0.5"},
 			srcPrefixes:  []netip.Prefix{mp("100.64.0.6/32")},
 			capMap: tailcfg.PeerCapMap{
-				tailcfg.PeerCapabilityTaildrive: {
+				peercap.Taildrive: {
 					tailcfg.RawMessage(`{"access":"rw"}`),
 				},
 			},
@@ -3284,7 +3263,7 @@ func TestCompanionCapGrantRules(t *testing.T) {
 						{
 							Dsts: []netip.Prefix{mp("100.64.0.6/32")},
 							CapMap: tailcfg.PeerCapMap{
-								tailcfg.PeerCapabilityTaildriveSharer: nil,
+								peercap.TaildriveSharer: nil,
 							},
 						},
 					},
@@ -3302,7 +3281,7 @@ func TestCompanionCapGrantRules(t *testing.T) {
 				mp("100.64.0.21/32"),
 			},
 			capMap: tailcfg.PeerCapMap{
-				tailcfg.PeerCapabilityRelay: {tailcfg.RawMessage(`{}`)},
+				peercap.Relay: {tailcfg.RawMessage(`{}`)},
 			},
 			want: []tailcfg.FilterRule{
 				{
@@ -3314,7 +3293,7 @@ func TestCompanionCapGrantRules(t *testing.T) {
 								mp("100.64.0.21/32"),
 							},
 							CapMap: tailcfg.PeerCapMap{
-								tailcfg.PeerCapabilityRelayTarget: nil,
+								peercap.RelayTarget: nil,
 							},
 						},
 					},
@@ -3502,7 +3481,7 @@ func TestFilterAllowAllFix(t *testing.T) {
 	t.Parallel()
 
 	users := types.Users{
-		{Model: gorm.Model{ID: 1}, Name: "testuser"},
+		{ID: 1, Name: "testuser"},
 	}
 	nodes := types.Nodes{
 		&types.Node{
@@ -3538,11 +3517,26 @@ func TestFilterAllowAllFix(t *testing.T) {
 			wantFilterAllow: true,
 		},
 		{
-			name: "nil ACLs and empty grants returns FilterAllowAll",
+			name: "nil ACLs and empty grants denies all",
 			pol: &Policy{
 				Grants: []Grant{},
 			},
-			wantFilterAllow: true,
+			wantFilterAllow: false,
+		},
+		{
+			name: "empty ACLs and nil grants denies all",
+			pol: &Policy{
+				ACLs: []ACL{},
+			},
+			wantFilterAllow: false,
+		},
+		{
+			name: "empty ACLs and empty grants denies all",
+			pol: &Policy{
+				ACLs:   []ACL{},
+				Grants: []Grant{},
+			},
+			wantFilterAllow: false,
 		},
 		{
 			name: "both ACLs and grants should not return FilterAllowAll",
@@ -3579,8 +3573,7 @@ func TestFilterAllowAllFix(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			rules, err := tt.pol.compileFilterRules(users, nodes)
-			require.NoError(t, err)
+			rules := tt.pol.compileFilterRules(users, nodes)
 
 			isFilterAllowAll := cmp.Diff(tailcfg.FilterAllowAll, rules) == ""
 			assert.Equal(t, tt.wantFilterAllow, isFilterAllowAll,
@@ -3593,7 +3586,7 @@ func TestCompileViaGrant(t *testing.T) {
 	t.Parallel()
 
 	users := types.Users{
-		{Model: gorm.Model{ID: 1}, Name: "testuser"},
+		{ID: 1, Name: "testuser"},
 	}
 
 	allPorts := []ProtocolPort{
@@ -3654,6 +3647,27 @@ func TestCompileViaGrant(t *testing.T) {
 		Hostinfo: &tailcfg.Hostinfo{},
 	}
 
+	// Expected rule for autogroup:internet on a via-tagged exit
+	// advertiser: SrcIPs scoped to the grant source, DstPorts
+	// enumerating util.TheInternet() prefixes.
+	internetDstPorts := make(
+		[]tailcfg.NetPortRange, 0, len(util.TheInternet().Prefixes()),
+	)
+
+	for _, p := range util.TheInternet().Prefixes() {
+		internetDstPorts = append(internetDstPorts, tailcfg.NetPortRange{
+			IP:    p.String(),
+			Ports: tailcfg.PortRangeAny,
+		})
+	}
+
+	internetWant := []tailcfg.FilterRule{
+		{
+			SrcIPs:   []string{"100.64.0.10"},
+			DstPorts: internetDstPorts,
+		},
+	}
+
 	tests := []struct {
 		name    string
 		grant   Grant
@@ -3710,11 +3724,12 @@ func TestCompileViaGrant(t *testing.T) {
 			},
 		},
 		{
-			// autogroup:internet via grants do NOT produce PacketFilter rules
-			// on exit nodes. Tailscale SaaS handles exit traffic forwarding
-			// through the client's exit node mechanism, not PacketFilter.
-			// Verified by golden captures GRANT-V14 through GRANT-V36.
-			name: "autogroup:internet with exit routes produces no rules",
+			// autogroup:internet on a via-tagged exit advertiser
+			// produces a rule with DstPorts enumerating
+			// util.TheInternet(). The matchers derived from this
+			// rule let Node.CanAccess surface the exit node to
+			// grant sources via DestsIsTheInternet.
+			name: "autogroup:internet with exit routes produces TheInternet rule",
 			grant: Grant{
 				Sources:           Aliases{up("testuser@")},
 				Destinations:      Aliases{agp(string(AutoGroupInternet))},
@@ -3724,7 +3739,7 @@ func TestCompileViaGrant(t *testing.T) {
 			node:  exitNode,
 			nodes: types.Nodes{exitNode, srcNode},
 			pol:   &Policy{},
-			want:  nil,
+			want:  internetWant,
 		},
 		{
 			name: "autogroup:internet without exit routes returns nil",
@@ -3791,7 +3806,7 @@ func TestCompileViaGrant(t *testing.T) {
 				Sources:      Aliases{up("testuser@")},
 				Destinations: Aliases{pp("10.0.0.0/24")},
 				App: tailcfg.PeerCapMap{
-					tailcfg.PeerCapabilityRelay: {tailcfg.RawMessage(`{}`)},
+					peercap.Relay: {tailcfg.RawMessage(`{}`)},
 				},
 				Via: []Tag{"tag:relay"},
 			},
@@ -3832,7 +3847,7 @@ func TestCompileViaGrant(t *testing.T) {
 			nodeView := tt.node.View()
 			nodesSlice := tt.nodes.ViewSlice()
 
-			got, err := tt.pol.compileViaGrant(tt.grant, users, nodeView, nodesSlice)
+			cg, err := tt.pol.compileOneGrant(tt.grant, users, nodesSlice)
 
 			if tt.wantErr != nil {
 				require.ErrorIs(t, err, tt.wantErr)
@@ -3841,6 +3856,11 @@ func TestCompileViaGrant(t *testing.T) {
 			}
 
 			require.NoError(t, err)
+
+			var got []tailcfg.FilterRule
+			if cg != nil {
+				got = compileViaForNode(cg, nodeView)
+			}
 
 			if tt.name == "wildcard sources include subnet routes in SrcIPs" {
 				// Wildcard resolves to CGNAT ranges; just check the route is appended.
@@ -3862,8 +3882,8 @@ func TestCompileGrantWithAutogroupSelf_GrantPaths(t *testing.T) {
 	t.Parallel()
 
 	users := types.Users{
-		{Model: gorm.Model{ID: 1}, Name: "user1"},
-		{Model: gorm.Model{ID: 2}, Name: "user2"},
+		{ID: 1, Name: "user1"},
+		{ID: 2, Name: "user2"},
 	}
 
 	node1 := &types.Node{
@@ -3997,9 +4017,10 @@ func TestCompileGrantWithAutogroupSelf_GrantPaths(t *testing.T) {
 
 			nodeView := tt.node.View()
 			nodesSlice := allNodes.ViewSlice()
+			userIdx := buildUserNodeIndex(nodesSlice)
 
-			got, err := tt.pol.compileGrantWithAutogroupSelf(
-				tt.grant, users, nodeView, nodesSlice,
+			cg, err := tt.pol.compileOneGrant(
+				tt.grant, users, nodesSlice,
 			)
 
 			if tt.wantErr != nil {
@@ -4009,6 +4030,13 @@ func TestCompileGrantWithAutogroupSelf_GrantPaths(t *testing.T) {
 			}
 
 			require.NoError(t, err)
+
+			var got []tailcfg.FilterRule
+			if cg != nil {
+				got = append(got, cg.rules...)
+				got = append(got, compileAutogroupSelf(cg, nodeView, userIdx)...)
+				got = mergeFilterRules(got)
+			}
 
 			switch tt.name {
 			case "autogroup:self destination for untagged node produces same-user devices":
@@ -4061,7 +4089,7 @@ func TestDestinationsToNetPortRange_AutogroupInternet(t *testing.T) {
 	t.Parallel()
 
 	users := types.Users{
-		{Model: gorm.Model{ID: 1}, Name: "testuser"},
+		{ID: 1, Name: "testuser"},
 	}
 	nodes := types.Nodes{
 		&types.Node{
@@ -4074,6 +4102,14 @@ func TestDestinationsToNetPortRange_AutogroupInternet(t *testing.T) {
 	pol := &Policy{}
 	ports := []tailcfg.PortRange{tailcfg.PortRangeAny}
 
+	// autogroup:internet must surface as DstPorts (not be skipped at
+	// compile time). The matcher derived from these FilterRules is
+	// what makes Node.CanAccess return true for exit-node peers via
+	// DestsIsTheInternet (#3212). The wire format is currently the
+	// canonical CIDR breakdown of util.TheInternet(); aligning it to
+	// the SaaS range form is tracked separately.
+	internetPrefixCount := len(util.TheInternet().Prefixes())
+
 	tests := []struct {
 		name     string
 		dests    Aliases
@@ -4081,9 +4117,9 @@ func TestDestinationsToNetPortRange_AutogroupInternet(t *testing.T) {
 		wantStar bool
 	}{
 		{
-			name:    "autogroup:internet produces no DstPorts",
+			name:    "autogroup:internet produces TheInternet DstPorts",
 			dests:   Aliases{agp(string(AutoGroupInternet))},
-			wantLen: 0,
+			wantLen: internetPrefixCount,
 		},
 		{
 			name:     "wildcard produces DstPorts with star",

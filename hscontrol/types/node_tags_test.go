@@ -5,10 +5,9 @@ import (
 
 	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/stretchr/testify/assert"
-	"gorm.io/gorm"
 )
 
-// TestNodeIsTagged tests the IsTagged() method for determining if a node is tagged.
+// TestNodeIsTagged tests the [Node.IsTagged] method for determining if a node is tagged.
 func TestNodeIsTagged(t *testing.T) {
 	tests := []struct {
 		name string
@@ -44,9 +43,9 @@ func TestNodeIsTagged(t *testing.T) {
 			want: false,
 		},
 		{
-			// Tags should be copied from AuthKey during registration, so a node
-			// with only AuthKey.Tags and no Tags would be invalid in practice.
-			// IsTagged() only checks node.Tags, not AuthKey.Tags.
+			// Tags should be copied from [Node.AuthKey] during registration, so a node
+			// with only [PreAuthKey.Tags] and no [Node.Tags] would be invalid in practice.
+			// [Node.IsTagged] only checks [Node.Tags], not [PreAuthKey.Tags].
 			name: "node registered with tagged authkey only - not tagged (tags should be copied)",
 			node: Node{
 				AuthKey: &PreAuthKey{
@@ -83,7 +82,7 @@ func TestNodeIsTagged(t *testing.T) {
 	}
 }
 
-// TestNodeViewIsTagged tests the IsTagged() method on NodeView.
+// TestNodeViewIsTagged tests the [NodeView.IsTagged] method on [NodeView].
 func TestNodeViewIsTagged(t *testing.T) {
 	tests := []struct {
 		name string
@@ -98,15 +97,15 @@ func TestNodeViewIsTagged(t *testing.T) {
 			want: true,
 		},
 		{
-			// Tags should be copied from AuthKey during registration, so a node
-			// with only AuthKey.Tags and no Tags would be invalid in practice.
+			// Tags should be copied from [Node.AuthKey] during registration, so a node
+			// with only [PreAuthKey.Tags] and no [Node.Tags] would be invalid in practice.
 			name: "node with only AuthKey tags - not tagged (tags should be copied)",
 			node: Node{
 				AuthKey: &PreAuthKey{
 					Tags: []string{"tag:web"},
 				},
 			},
-			want: false, // IsTagged() only checks node.Tags
+			want: false, // [Node.IsTagged] only checks [Node.Tags]
 		},
 		{
 			name: "user-owned node",
@@ -126,7 +125,7 @@ func TestNodeViewIsTagged(t *testing.T) {
 	}
 }
 
-// TestNodeHasTag tests the HasTag() method for checking specific tag membership.
+// TestNodeHasTag tests the [Node.HasTag] method for checking specific tag membership.
 func TestNodeHasTag(t *testing.T) {
 	tests := []struct {
 		name string
@@ -151,8 +150,8 @@ func TestNodeHasTag(t *testing.T) {
 			want: false,
 		},
 		{
-			// Tags should be copied from AuthKey during registration
-			// HasTag() only checks node.Tags, not AuthKey.Tags
+			// Tags should be copied from [Node.AuthKey] during registration
+			// [Node.HasTag] only checks [Node.Tags], not [PreAuthKey.Tags]
 			name: "node has tag only in authkey - returns false",
 			node: Node{
 				AuthKey: &PreAuthKey{
@@ -163,7 +162,7 @@ func TestNodeHasTag(t *testing.T) {
 			want: false,
 		},
 		{
-			// node.Tags is what matters, not AuthKey.Tags
+			// [Node.Tags] is what matters, not [PreAuthKey.Tags]
 			name: "node has tag in Tags but not in AuthKey",
 			node: Node{
 				Tags: []string{"tag:server"},
@@ -259,8 +258,8 @@ func TestNodeOwnershipModel(t *testing.T) {
 			description:  "User-owned nodes are owned by the user, not by tags",
 		},
 		{
-			// Tags should be copied from AuthKey to Node during registration
-			// IsTagged() only checks node.Tags, not AuthKey.Tags
+			// Tags should be copied from [Node.AuthKey] to [Node] during registration
+			// [Node.IsTagged] only checks [Node.Tags], not [PreAuthKey.Tags]
 			name: "node with only authkey tags - not tagged (tags should be copied)",
 			node: Node{
 				ID:     3,
@@ -285,7 +284,7 @@ func TestNodeOwnershipModel(t *testing.T) {
 // TestUserTypedID tests the TypedID() helper method.
 func TestUserTypedID(t *testing.T) {
 	user := User{
-		Model: gorm.Model{ID: 42},
+		ID: 42,
 	}
 
 	typedID := user.TypedID()

@@ -6,6 +6,7 @@ import (
 	"cmp"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,16 +19,16 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/davecgh/go-spew/spew"
-	v1 "github.com/juanfont/headscale/gen/go/headscale/v1"
+	clientv1 "github.com/juanfont/headscale/gen/client/v1"
+	clientv2 "github.com/juanfont/headscale/gen/client/v2"
 	"github.com/juanfont/headscale/hscontrol"
 	policyv2 "github.com/juanfont/headscale/hscontrol/policy/v2"
-	"github.com/juanfont/headscale/hscontrol/routes"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/juanfont/headscale/integration/dockertestutil"
@@ -37,6 +38,7 @@ import (
 	"gopkg.in/yaml.v3"
 	"tailscale.com/tailcfg"
 	"tailscale.com/util/mak"
+	"tailscale.com/util/rands"
 )
 
 const (
@@ -49,6 +51,9 @@ const (
 	headscaleDefaultPort          = 8080
 	IntegrationTestDockerFileName = "Dockerfile.integration"
 	defaultDirPerm                = 0o755
+	binHeadscale                  = "headscale"
+	flagOutput                    = "--output"
+	acceptJSON                    = "Accept: application/json"
 )
 
 var (
@@ -95,8 +100,8 @@ type HeadscaleInContainer struct {
 // Headscale instance.
 type Option = func(c *HeadscaleInContainer)
 
-// WithACLPolicy adds a hscontrol.ACLPolicy policy to the
-// HeadscaleInContainer instance.
+// WithACLPolicy adds a [policyv2.Policy] to the
+// [HeadscaleInContainer] instance.
 func WithACLPolicy(acl *policyv2.Policy) Option {
 	return func(hsic *HeadscaleInContainer) {
 		if acl == nil {
@@ -128,7 +133,7 @@ func WithoutTLS() Option {
 
 // WithCustomTLS uses the given certificates for the Headscale instance.
 // The caCert is installed into the container's trust store and returned
-// by GetCert() so that clients can trust this server.
+// by [HeadscaleInContainer.GetCert] so that clients can trust this server.
 func WithCustomTLS(caCert, cert, key []byte) Option {
 	return func(hsic *HeadscaleInContainer) {
 		hsic.tlsCACert = caCert
@@ -170,7 +175,7 @@ func WithHostPortBindings(bindings map[string][]string) Option {
 // in the Docker container name.
 func WithTestName(testName string) Option {
 	return func(hsic *HeadscaleInContainer) {
-		hash, _ := util.GenerateRandomStringDNSSafe(hsicHashLength)
+		hash := rands.HexString(hsicHashLength)
 
 		hostname := fmt.Sprintf("hs-%s-%s", testName, hash)
 		hsic.hostname = hostname
@@ -321,7 +326,7 @@ func (hsic *HeadscaleInContainer) buildEntrypoint() []string {
 	return []string{"/bin/bash", "-c", strings.Join(commands, " ; ")}
 }
 
-// New returns a new HeadscaleInContainer instance.
+// New returns a new [HeadscaleInContainer] instance.
 //
 //nolint:gocyclo // complex container setup with many options
 func New(
@@ -329,10 +334,7 @@ func New(
 	networks []*dockertest.Network,
 	opts ...Option,
 ) (*HeadscaleInContainer, error) {
-	hash, err := util.GenerateRandomStringDNSSafe(hsicHashLength)
-	if err != nil {
-		return nil, err
-	}
+	hash := rands.HexString(hsicHashLength)
 
 	// Include run ID in hostname for easier identification of which test run owns this container
 	runID := dockertestutil.GetIntegrationRunID()
@@ -365,8 +367,8 @@ func New(
 
 	// TLS is enabled by default for all integration tests.
 	// Generate a self-signed certificate if TLS was not explicitly
-	// disabled via WithoutTLS() and no custom cert was provided
-	// via WithCustomTLS().
+	// disabled via [WithoutTLS] and no custom cert was provided
+	// via [WithCustomTLS].
 	if !hsic.noTLS && len(hsic.tlsCert) == 0 {
 		caCert, cert, key, err := integrationutil.CreateCertificate(hsic.hostname)
 		if err != nil {
@@ -395,9 +397,9 @@ func New(
 	if hsic.postgres {
 		hsic.env["HEADSCALE_DATABASE_TYPE"] = "postgres"
 		hsic.env["HEADSCALE_DATABASE_POSTGRES_HOST"] = "postgres-" + hash
-		hsic.env["HEADSCALE_DATABASE_POSTGRES_USER"] = "headscale"
-		hsic.env["HEADSCALE_DATABASE_POSTGRES_PASS"] = "headscale"
-		hsic.env["HEADSCALE_DATABASE_POSTGRES_NAME"] = "headscale"
+		hsic.env["HEADSCALE_DATABASE_POSTGRES_USER"] = binHeadscale
+		hsic.env["HEADSCALE_DATABASE_POSTGRES_PASS"] = binHeadscale
+		hsic.env["HEADSCALE_DATABASE_POSTGRES_NAME"] = binHeadscale
 		delete(hsic.env, "HEADSCALE_DATABASE_SQLITE_PATH")
 
 		// Determine postgres image - use prebuilt if available, otherwise pull from registry
@@ -488,7 +490,8 @@ func New(
 			for _, hostPort := range hostPorts {
 				runOptions.PortBindings[docker.Port(port)] = append(
 					runOptions.PortBindings[docker.Port(port)],
-					docker.PortBinding{HostPort: hostPort})
+					docker.PortBinding{HostPort: hostPort},
+				)
 			}
 		}
 	}
@@ -496,13 +499,13 @@ func New(
 	// dockertest isn't very good at handling containers that has already
 	// been created, this is an attempt to make sure this container isn't
 	// present.
-	err = pool.RemoveContainerByName(hsic.hostname)
+	err := pool.RemoveContainerByName(hsic.hostname)
 	if err != nil {
 		return nil, err
 	}
 
 	// Add integration test labels if running under hi tool
-	dockertestutil.DockerAddIntegrationLabels(runOptions, "headscale")
+	dockertestutil.DockerAddIntegrationLabels(runOptions, binHeadscale)
 
 	var container *dockertest.Resource
 
@@ -510,7 +513,7 @@ func New(
 	prebuiltImage := os.Getenv("HEADSCALE_INTEGRATION_HEADSCALE_IMAGE")
 
 	if prebuiltImage != "" {
-		log.Printf("Using pre-built headscale image: %s", prebuiltImage)
+		log.Printf("Using pre-built headscale image: %s", prebuiltImage) //nolint:gosec // G706: integration-only log of trusted env value
 		// Parse image into repository and tag
 		repo, tag, ok := strings.Cut(prebuiltImage, ":")
 		if !ok {
@@ -710,7 +713,7 @@ func (t *HeadscaleInContainer) Shutdown() (string, string, error) {
 }
 
 // WriteLogs writes the current stdout/stderr log of the container to
-// the given io.Writers.
+// the given [io.Writer]s.
 func (t *HeadscaleInContainer) WriteLogs(stdout, stderr io.Writer) error {
 	return dockertestutil.WriteLog(t.pool, t.container, stdout, stderr)
 }
@@ -1011,15 +1014,99 @@ func (t *HeadscaleInContainer) GetHostMetricsPort() string {
 	return t.hostMetricsPort
 }
 
-// GetHealthEndpoint returns a health endpoint for the HeadscaleInContainer
+// GetHealthEndpoint returns a health endpoint for the [HeadscaleInContainer]
 // instance.
 func (t *HeadscaleInContainer) GetHealthEndpoint() string {
 	return t.GetEndpoint() + "/health"
 }
 
-// GetEndpoint returns the Headscale endpoint for the HeadscaleInContainer.
+// GetEndpoint returns the Headscale endpoint for the [HeadscaleInContainer].
 func (t *HeadscaleInContainer) GetEndpoint() string {
 	return t.getEndpoint(false)
+}
+
+var errOAuthSecretMissing = errors.New(`OAuth client response missing secret in "key" field`)
+
+// CreateOAuthClient mints an admin API key and uses it to create an OAuth client
+// via the v2 keys HTTP API (POST /api/v2/tailnet/-/keys, keyType=client),
+// returning the client id and secret. The secret is only returned once, in the
+// "key" field. It is a reusable building block for tests that need OAuth client
+// credentials (such as the Kubernetes operator).
+func (t *HeadscaleInContainer) CreateOAuthClient(
+	ctx context.Context,
+	scopes, tags []string,
+) (string, string, error) {
+	apiKey, err := t.Execute([]string{"headscale", "apikeys", "create", "--expiration", "24h"})
+	if err != nil {
+		return "", "", fmt.Errorf("creating admin api key: %w", err)
+	}
+
+	apiKey = strings.TrimSpace(apiKey)
+
+	client, err := clientv2.NewClientWithResponses(
+		t.GetEndpoint(),
+		clientv2.WithHTTPClient(t.httpClient()),
+		clientv2.WithRequestEditorFn(func(_ context.Context, req *http.Request) error {
+			req.Header.Set("Authorization", "Bearer "+apiKey)
+
+			return nil
+		}),
+	)
+	if err != nil {
+		return "", "", fmt.Errorf("building v2 API client: %w", err)
+	}
+
+	keyType := "client"
+
+	resp, err := client.CreateKeyWithResponse(ctx, "-", clientv2.CreateKeyRequest{
+		KeyType: &keyType,
+		Scopes:  &scopes,
+		Tags:    &tags,
+	})
+	if err != nil {
+		return "", "", fmt.Errorf("creating OAuth client: %w", err)
+	}
+
+	if resp.JSON200 == nil {
+		return "", "", fmt.Errorf( //nolint:err113
+			"creating OAuth client: status %s: %s", resp.Status(), strings.TrimSpace(string(resp.Body)))
+	}
+
+	if resp.JSON200.Key == nil || *resp.JSON200.Key == "" {
+		return "", "", errOAuthSecretMissing
+	}
+
+	// The operator expects clientId and clientSecret as separate values. When the
+	// server returns a single opaque credential, the client-credentials grant
+	// splits it on "-" (id-secret), matching the Tailscale SaaS shape. Fall back
+	// to the whole key as the secret when no id is given.
+	clientID, clientSecret := resp.JSON200.Id, *resp.JSON200.Key
+
+	if clientID == "" {
+		if id, secret, ok := strings.Cut(*resp.JSON200.Key, "-"); ok {
+			clientID, clientSecret = id, secret
+		}
+	}
+
+	return clientID, clientSecret, nil
+}
+
+// httpClient returns an HTTP client that trusts this Headscale's TLS CA when TLS
+// is enabled, or a default client when it serves plain HTTP.
+func (t *HeadscaleInContainer) httpClient() *http.Client {
+	if !t.hasTLS() {
+		return &http.Client{Timeout: 30 * time.Second}
+	}
+
+	pool := x509.NewCertPool()
+	pool.AppendCertsFromPEM(t.tlsCACert)
+
+	return &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12},
+		},
+	}
 }
 
 // GetIPEndpoint returns the Headscale endpoint using IP address instead of hostname.
@@ -1052,12 +1139,12 @@ func (t *HeadscaleInContainer) GetCert() []byte {
 	return t.tlsCACert
 }
 
-// GetHostname returns the hostname of the HeadscaleInContainer.
+// GetHostname returns the hostname of the [HeadscaleInContainer].
 func (t *HeadscaleInContainer) GetHostname() string {
 	return t.hostname
 }
 
-// GetIPInNetwork returns the IP address of the HeadscaleInContainer in the given network.
+// GetIPInNetwork returns the IP address of the [HeadscaleInContainer] in the given network.
 func (t *HeadscaleInContainer) GetIPInNetwork(network *dockertest.Network) string {
 	return t.container.GetIPInNetwork(network)
 }
@@ -1094,14 +1181,14 @@ func (t *HeadscaleInContainer) WaitForRunning() error {
 // CreateUser adds a new user to the Headscale instance.
 func (t *HeadscaleInContainer) CreateUser(
 	user string,
-) (*v1.User, error) {
+) (*clientv1.User, error) {
 	command := []string{
-		"headscale",
+		binHeadscale,
 		"users",
 		"create",
 		user,
 		fmt.Sprintf("--email=%s@test.no", user),
-		"--output",
+		flagOutput,
 		"json",
 	}
 
@@ -1114,7 +1201,7 @@ func (t *HeadscaleInContainer) CreateUser(
 		return nil, err
 	}
 
-	var u v1.User
+	var u clientv1.User
 
 	err = json.Unmarshal([]byte(result), &u)
 	if err != nil {
@@ -1139,9 +1226,9 @@ type AuthKeyOptions struct {
 
 // CreateAuthKeyWithOptions creates a new "authorisation key" with the specified options.
 // This supports both user-owned and tags-only auth keys.
-func (t *HeadscaleInContainer) CreateAuthKeyWithOptions(opts AuthKeyOptions) (*v1.PreAuthKey, error) {
+func (t *HeadscaleInContainer) CreateAuthKeyWithOptions(opts AuthKeyOptions) (*clientv1.PreAuthKey, error) {
 	command := []string{
-		"headscale",
+		binHeadscale,
 	}
 
 	// Only add --user flag if User is specified
@@ -1149,12 +1236,13 @@ func (t *HeadscaleInContainer) CreateAuthKeyWithOptions(opts AuthKeyOptions) (*v
 		command = append(command, "--user", strconv.FormatUint(*opts.User, 10))
 	}
 
-	command = append(command,
+	command = append(
+		command,
 		"preauthkeys",
 		"create",
 		"--expiration",
 		"24h",
-		"--output",
+		flagOutput,
 		"json",
 	)
 
@@ -1179,7 +1267,7 @@ func (t *HeadscaleInContainer) CreateAuthKeyWithOptions(opts AuthKeyOptions) (*v
 		return nil, fmt.Errorf("executing create auth key command: %w", err)
 	}
 
-	var preAuthKey v1.PreAuthKey
+	var preAuthKey clientv1.PreAuthKey
 
 	err = json.Unmarshal([]byte(result), &preAuthKey)
 	if err != nil {
@@ -1190,12 +1278,12 @@ func (t *HeadscaleInContainer) CreateAuthKeyWithOptions(opts AuthKeyOptions) (*v
 }
 
 // CreateAuthKey creates a new "authorisation key" for a User that can be used
-// to authorise a TailscaleClient with the Headscale instance.
+// to authorise a TailscaleClient with the [HeadscaleInContainer] instance.
 func (t *HeadscaleInContainer) CreateAuthKey(
 	user uint64,
 	reusable bool,
 	ephemeral bool,
-) (*v1.PreAuthKey, error) {
+) (*clientv1.PreAuthKey, error) {
 	return t.CreateAuthKeyWithOptions(AuthKeyOptions{
 		User:      &user,
 		Reusable:  reusable,
@@ -1210,7 +1298,7 @@ func (t *HeadscaleInContainer) CreateAuthKeyWithTags(
 	reusable bool,
 	ephemeral bool,
 	tags []string,
-) (*v1.PreAuthKey, error) {
+) (*clientv1.PreAuthKey, error) {
 	return t.CreateAuthKeyWithOptions(AuthKeyOptions{
 		User:      &user,
 		Reusable:  reusable,
@@ -1224,12 +1312,12 @@ func (t *HeadscaleInContainer) DeleteAuthKey(
 	id uint64,
 ) error {
 	command := []string{
-		"headscale",
+		binHeadscale,
 		"preauthkeys",
 		"delete",
 		"--id",
 		strconv.FormatUint(id, 10),
-		"--output",
+		flagOutput,
 		"json",
 	}
 
@@ -1250,8 +1338,8 @@ func (t *HeadscaleInContainer) DeleteAuthKey(
 // specific users.
 func (t *HeadscaleInContainer) ListNodes(
 	users ...string,
-) ([]*v1.Node, error) {
-	var ret []*v1.Node
+) ([]*clientv1.Node, error) {
+	var ret []*clientv1.Node
 
 	execUnmarshal := func(command []string) error {
 		result, _, err := dockertestutil.ExecuteCommand(
@@ -1263,7 +1351,7 @@ func (t *HeadscaleInContainer) ListNodes(
 			return fmt.Errorf("executing list node command: %w", err)
 		}
 
-		var nodes []*v1.Node
+		var nodes []*clientv1.Node
 
 		err = json.Unmarshal([]byte(result), &nodes)
 		if err != nil {
@@ -1276,13 +1364,13 @@ func (t *HeadscaleInContainer) ListNodes(
 	}
 
 	if len(users) == 0 {
-		err := execUnmarshal([]string{"headscale", "nodes", "list", "--output", "json"})
+		err := execUnmarshal([]string{binHeadscale, "nodes", "list", flagOutput, "json"})
 		if err != nil {
 			return nil, err
 		}
 	} else {
 		for _, user := range users {
-			command := []string{"headscale", "--user", user, "nodes", "list", "--output", "json"}
+			command := []string{binHeadscale, "--user", user, "nodes", "list", flagOutput, "json"}
 
 			err := execUnmarshal(command)
 			if err != nil {
@@ -1291,8 +1379,11 @@ func (t *HeadscaleInContainer) ListNodes(
 		}
 	}
 
-	sort.Slice(ret, func(i, j int) bool {
-		return cmp.Compare(ret[i].GetId(), ret[j].GetId()) == -1
+	slices.SortFunc(ret, func(a, b *clientv1.Node) int {
+		ai, _ := strconv.ParseUint(a.Id, 10, 64)
+		bi, _ := strconv.ParseUint(b.Id, 10, 64)
+
+		return cmp.Compare(ai, bi)
 	})
 
 	return ret, nil
@@ -1300,12 +1391,12 @@ func (t *HeadscaleInContainer) ListNodes(
 
 func (t *HeadscaleInContainer) DeleteNode(nodeID uint64) error {
 	command := []string{
-		"headscale",
+		binHeadscale,
 		"nodes",
 		"delete",
 		"--identifier",
 		strconv.FormatUint(nodeID, 10),
-		"--output",
+		flagOutput,
 		"json",
 		"--force",
 	}
@@ -1322,41 +1413,39 @@ func (t *HeadscaleInContainer) DeleteNode(nodeID uint64) error {
 	return nil
 }
 
-func (t *HeadscaleInContainer) NodesByUser() (map[string][]*v1.Node, error) {
+func (t *HeadscaleInContainer) NodesByUser() (map[string][]*clientv1.Node, error) {
 	nodes, err := t.ListNodes()
 	if err != nil {
 		return nil, err
 	}
 
-	var userMap map[string][]*v1.Node
+	userMap := make(map[string][]*clientv1.Node)
+
 	for _, node := range nodes {
-		if _, ok := userMap[node.GetUser().GetName()]; !ok {
-			mak.Set(&userMap, node.GetUser().GetName(), []*v1.Node{node})
-		} else {
-			userMap[node.GetUser().GetName()] = append(userMap[node.GetUser().GetName()], node)
-		}
+		name := node.User.Name
+		userMap[name] = append(userMap[name], node)
 	}
 
 	return userMap, nil
 }
 
-func (t *HeadscaleInContainer) NodesByName() (map[string]*v1.Node, error) {
+func (t *HeadscaleInContainer) NodesByName() (map[string]*clientv1.Node, error) {
 	nodes, err := t.ListNodes()
 	if err != nil {
 		return nil, err
 	}
 
-	var nameMap map[string]*v1.Node
+	var nameMap map[string]*clientv1.Node
 	for _, node := range nodes {
-		mak.Set(&nameMap, node.GetName(), node)
+		mak.Set(&nameMap, node.Name, node)
 	}
 
 	return nameMap, nil
 }
 
 // ListUsers returns a list of users from Headscale.
-func (t *HeadscaleInContainer) ListUsers() ([]*v1.User, error) {
-	command := []string{"headscale", "users", "list", "--output", "json"}
+func (t *HeadscaleInContainer) ListUsers() ([]*clientv1.User, error) {
+	command := []string{binHeadscale, "users", "list", flagOutput, "json"}
 
 	result, _, err := dockertestutil.ExecuteCommand(
 		t.container,
@@ -1367,7 +1456,7 @@ func (t *HeadscaleInContainer) ListUsers() ([]*v1.User, error) {
 		return nil, fmt.Errorf("executing list node command: %w", err)
 	}
 
-	var users []*v1.User
+	var users []*clientv1.User
 
 	err = json.Unmarshal([]byte(result), &users)
 	if err != nil {
@@ -1379,15 +1468,15 @@ func (t *HeadscaleInContainer) ListUsers() ([]*v1.User, error) {
 
 // MapUsers returns a map of users from Headscale. It is keyed by the
 // user name.
-func (t *HeadscaleInContainer) MapUsers() (map[string]*v1.User, error) {
+func (t *HeadscaleInContainer) MapUsers() (map[string]*clientv1.User, error) {
 	users, err := t.ListUsers()
 	if err != nil {
 		return nil, err
 	}
 
-	var userMap map[string]*v1.User
+	var userMap map[string]*clientv1.User
 	for _, user := range users {
-		mak.Set(&userMap, user.GetName(), user)
+		mak.Set(&userMap, user.Name, user)
 	}
 
 	return userMap, nil
@@ -1396,13 +1485,13 @@ func (t *HeadscaleInContainer) MapUsers() (map[string]*v1.User, error) {
 // DeleteUser deletes a user from the Headscale instance.
 func (t *HeadscaleInContainer) DeleteUser(userID uint64) error {
 	command := []string{
-		"headscale",
+		binHeadscale,
 		"users",
 		"delete",
 		"--identifier",
 		strconv.FormatUint(userID, 10),
 		"--force",
-		"--output",
+		flagOutput,
 		"json",
 	}
 
@@ -1445,7 +1534,7 @@ func (h *HeadscaleInContainer) SetPolicy(pol *policyv2.Policy) error {
 func (h *HeadscaleInContainer) reloadDatabasePolicy() error {
 	_, err := h.Execute(
 		[]string{
-			"headscale",
+			binHeadscale,
 			"policy",
 			"set",
 			"-f",
@@ -1477,7 +1566,7 @@ func (h *HeadscaleInContainer) PID() (int, error) {
 	// Use pidof to find the headscale process, which is more reliable than grep
 	// as it only looks for the actual binary name, not processes that contain
 	// "headscale" in their command line (like the dlv debugger).
-	output, err := h.Execute([]string{"pidof", "headscale"})
+	output, err := h.Execute([]string{"pidof", binHeadscale})
 	if err != nil {
 		// pidof returns exit code 1 when no process is found
 		return 0, os.ErrNotExist
@@ -1531,11 +1620,25 @@ func (h *HeadscaleInContainer) Reload() error {
 	return nil
 }
 
+// Restart restarts the headscale container. The on-disk database and keys
+// persist across the restart, but all in-memory state is dropped — including
+// the bounded cache of pending authentication sessions. This reproduces a
+// control-plane restart, one of the real-world cases where a pending SSH-check
+// auth session is lost.
+func (h *HeadscaleInContainer) Restart() error {
+	err := h.pool.Client.RestartContainer(h.container.Container.ID, 30)
+	if err != nil {
+		return fmt.Errorf("restarting headscale container %s: %w", h.hostname, err)
+	}
+
+	return h.WaitForRunning()
+}
+
 // ApproveRoutes approves routes for a node.
-func (t *HeadscaleInContainer) ApproveRoutes(id uint64, routes []netip.Prefix) (*v1.Node, error) {
+func (t *HeadscaleInContainer) ApproveRoutes(id uint64, routes []netip.Prefix) (*clientv1.Node, error) {
 	command := []string{
-		"headscale", "nodes", "approve-routes",
-		"--output", "json",
+		binHeadscale, "nodes", "approve-routes",
+		flagOutput, "json",
 		"--identifier", strconv.FormatUint(id, 10),
 		"--routes=" + strings.Join(util.PrefixesToString(routes), ","),
 	}
@@ -1554,7 +1657,7 @@ func (t *HeadscaleInContainer) ApproveRoutes(id uint64, routes []netip.Prefix) (
 		)
 	}
 
-	var node *v1.Node
+	var node *clientv1.Node
 
 	err = json.Unmarshal([]byte(result), &node)
 	if err != nil {
@@ -1569,9 +1672,9 @@ func (t *HeadscaleInContainer) ApproveRoutes(id uint64, routes []netip.Prefix) (
 // SetTags API which is exposed via the CLI command: headscale nodes tag -i <id> -t <tags>.
 func (t *HeadscaleInContainer) SetNodeTags(nodeID uint64, tags []string) error {
 	command := []string{
-		"headscale", "nodes", "tag",
+		binHeadscale, "nodes", "tag",
 		"--identifier", strconv.FormatUint(nodeID, 10),
-		"--output", "json",
+		flagOutput, "json",
 	}
 
 	// Add tags - the CLI expects -t flag for each tag or comma-separated
@@ -1606,7 +1709,7 @@ func (t *HeadscaleInContainer) FetchPath(path string) ([]byte, error) {
 }
 
 func (t *HeadscaleInContainer) SendInterrupt() error {
-	pid, err := t.Execute([]string{"pidof", "headscale"})
+	pid, err := t.Execute([]string{"pidof", binHeadscale})
 	if err != nil {
 		return err
 	}
@@ -1620,102 +1723,48 @@ func (t *HeadscaleInContainer) SendInterrupt() error {
 }
 
 func (t *HeadscaleInContainer) GetAllMapReponses() (map[types.NodeID][]tailcfg.MapResponse, error) {
-	// Execute curl inside the container to access the debug endpoint locally
-	command := []string{
-		"curl", "-s", "-H", "Accept: application/json", "http://localhost:9090/debug/mapresponses",
-	}
-
-	result, err := t.Execute(command)
-	if err != nil {
-		return nil, fmt.Errorf("fetching mapresponses from debug endpoint: %w", err)
-	}
-
-	var res map[types.NodeID][]tailcfg.MapResponse
-	if err := json.Unmarshal([]byte(result), &res); err != nil { //nolint:noinlineerr
-		return nil, fmt.Errorf("decoding routes response: %w", err)
-	}
-
-	return res, nil
+	return t.debugJSON[map[types.NodeID][]tailcfg.MapResponse]("mapresponses")
 }
 
 // PrimaryRoutes fetches the primary routes from the debug endpoint.
-func (t *HeadscaleInContainer) PrimaryRoutes() (*routes.DebugRoutes, error) {
-	// Execute curl inside the container to access the debug endpoint locally
-	command := []string{
-		"curl", "-s", "-H", "Accept: application/json", "http://localhost:9090/debug/routes",
-	}
-
-	result, err := t.Execute(command)
-	if err != nil {
-		return nil, fmt.Errorf("fetching routes from debug endpoint: %w", err)
-	}
-
-	var debugRoutes routes.DebugRoutes
-	if err := json.Unmarshal([]byte(result), &debugRoutes); err != nil { //nolint:noinlineerr
-		return nil, fmt.Errorf("decoding routes response: %w", err)
-	}
-
-	return &debugRoutes, nil
+func (t *HeadscaleInContainer) PrimaryRoutes() (*types.DebugRoutes, error) {
+	return t.debugJSON[*types.DebugRoutes]("routes")
 }
 
 // DebugBatcher fetches the batcher debug information from the debug endpoint.
 func (t *HeadscaleInContainer) DebugBatcher() (*hscontrol.DebugBatcherInfo, error) {
-	// Execute curl inside the container to access the debug endpoint locally
-	command := []string{
-		"curl", "-s", "-H", "Accept: application/json", "http://localhost:9090/debug/batcher",
-	}
-
-	result, err := t.Execute(command)
-	if err != nil {
-		return nil, fmt.Errorf("fetching batcher debug info: %w", err)
-	}
-
-	var debugInfo hscontrol.DebugBatcherInfo
-	if err := json.Unmarshal([]byte(result), &debugInfo); err != nil { //nolint:noinlineerr
-		return nil, fmt.Errorf("decoding batcher debug response: %w", err)
-	}
-
-	return &debugInfo, nil
+	return t.debugJSON[*hscontrol.DebugBatcherInfo]("batcher")
 }
 
-// DebugNodeStore fetches the NodeStore data from the debug endpoint.
+// DebugNodeStore fetches the [state.NodeStore] data from the debug endpoint.
 func (t *HeadscaleInContainer) DebugNodeStore() (map[types.NodeID]types.Node, error) {
-	// Execute curl inside the container to access the debug endpoint locally
-	command := []string{
-		"curl", "-s", "-H", "Accept: application/json", "http://localhost:9090/debug/nodestore",
-	}
-
-	result, err := t.Execute(command)
-	if err != nil {
-		return nil, fmt.Errorf("fetching nodestore debug info: %w", err)
-	}
-
-	var nodeStore map[types.NodeID]types.Node
-	if err := json.Unmarshal([]byte(result), &nodeStore); err != nil { //nolint:noinlineerr
-		return nil, fmt.Errorf("decoding nodestore debug response: %w", err)
-	}
-
-	return nodeStore, nil
+	return t.debugJSON[map[types.NodeID]types.Node]("nodestore")
 }
 
 // DebugFilter fetches the current filter rules from the debug endpoint.
 func (t *HeadscaleInContainer) DebugFilter() ([]tailcfg.FilterRule, error) {
+	return t.debugJSON[[]tailcfg.FilterRule]("filter")
+}
+
+// debugJSON fetches and decodes a JSON-returning debug endpoint by name.
+func (t *HeadscaleInContainer) debugJSON[T any](endpoint string) (T, error) {
+	var res T
+
 	// Execute curl inside the container to access the debug endpoint locally
 	command := []string{
-		"curl", "-s", "-H", "Accept: application/json", "http://localhost:9090/debug/filter",
+		"curl", "-s", "-H", acceptJSON, "http://localhost:9090/debug/" + endpoint,
 	}
 
 	result, err := t.Execute(command)
 	if err != nil {
-		return nil, fmt.Errorf("fetching filter from debug endpoint: %w", err)
+		return res, fmt.Errorf("fetching %s from debug endpoint: %w", endpoint, err)
 	}
 
-	var filterRules []tailcfg.FilterRule
-	if err := json.Unmarshal([]byte(result), &filterRules); err != nil { //nolint:noinlineerr
-		return nil, fmt.Errorf("decoding filter response: %w", err)
+	if err := json.Unmarshal([]byte(result), &res); err != nil { //nolint:noinlineerr
+		return res, fmt.Errorf("decoding %s response: %w", endpoint, err)
 	}
 
-	return filterRules, nil
+	return res, nil
 }
 
 // DebugPolicy fetches the current policy from the debug endpoint.

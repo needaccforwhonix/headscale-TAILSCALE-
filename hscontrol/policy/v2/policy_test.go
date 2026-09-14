@@ -4,12 +4,14 @@ import (
 	"net/netip"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/juanfont/headscale/hscontrol/policy/matcher"
 	"github.com/juanfont/headscale/hscontrol/types"
+	"github.com/puzpuzpuz/xsync/v4"
 	"github.com/stretchr/testify/require"
-	"gorm.io/gorm"
+	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
 )
 
@@ -26,8 +28,8 @@ func node(name, ipv4, ipv6 string, user types.User) *types.Node {
 
 func TestPolicyManager(t *testing.T) {
 	users := types.Users{
-		{Model: gorm.Model{ID: 1}, Name: "testuser", Email: "testuser@headscale.net"},
-		{Model: gorm.Model{ID: 2}, Name: "otheruser", Email: "otheruser@headscale.net"},
+		{ID: 1, Name: "testuser", Email: "testuser@headscale.net"},
+		{ID: 2, Name: "otheruser", Email: "otheruser@headscale.net"},
 	}
 
 	tests := []struct {
@@ -43,6 +45,20 @@ func TestPolicyManager(t *testing.T) {
 			nodes:        types.Nodes{},
 			wantFilter:   tailcfg.FilterAllowAll,
 			wantMatchers: matcher.MatchesFromFilterRules(tailcfg.FilterAllowAll),
+		},
+		{
+			name:         "empty-acls-denies-all",
+			pol:          `{"acls": []}`,
+			nodes:        types.Nodes{},
+			wantFilter:   nil,
+			wantMatchers: matcher.MatchesFromFilterRules(nil),
+		},
+		{
+			name:         "empty-grants-denies-all",
+			pol:          `{"grants": []}`,
+			nodes:        types.Nodes{},
+			wantFilter:   nil,
+			wantMatchers: matcher.MatchesFromFilterRules(nil),
 		},
 	}
 
@@ -71,9 +87,9 @@ func TestPolicyManager(t *testing.T) {
 
 func TestInvalidateAutogroupSelfCache(t *testing.T) {
 	users := types.Users{
-		{Model: gorm.Model{ID: 1}, Name: "user1", Email: "user1@headscale.net"},
-		{Model: gorm.Model{ID: 2}, Name: "user2", Email: "user2@headscale.net"},
-		{Model: gorm.Model{ID: 3}, Name: "user3", Email: "user3@headscale.net"},
+		{ID: 1, Name: "user1", Email: "user1@headscale.net"},
+		{ID: 2, Name: "user2", Email: "user2@headscale.net"},
+		{ID: 3, Name: "user3", Email: "user3@headscale.net"},
 	}
 
 	//nolint:goconst // test-specific inline policy for clarity
@@ -107,7 +123,7 @@ func TestInvalidateAutogroupSelfCache(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	require.Len(t, pm.filterRulesMap, len(initialNodes))
+	require.Equal(t, len(initialNodes), pm.filterRulesMap.Size())
 
 	tests := []struct {
 		name            string
@@ -192,21 +208,227 @@ func TestInvalidateAutogroupSelfCache(t *testing.T) {
 				}
 			}
 
-			pm.filterRulesMap = make(map[types.NodeID][]tailcfg.FilterRule)
+			pm.filterRulesMap.Clear()
+
 			for _, n := range initialNodes {
 				_, err := pm.FilterForNode(n.View())
 				require.NoError(t, err)
 			}
 
-			initialCacheSize := len(pm.filterRulesMap)
+			initialCacheSize := pm.filterRulesMap.Size()
 			require.Equal(t, len(initialNodes), initialCacheSize)
 
 			pm.invalidateAutogroupSelfCache(initialNodes.ViewSlice(), tt.newNodes.ViewSlice())
 
 			// Verify the expected number of cache entries were cleared
-			finalCacheSize := len(pm.filterRulesMap)
+			finalCacheSize := pm.filterRulesMap.Size()
 			clearedEntries := initialCacheSize - finalCacheSize
 			require.Equal(t, tt.expectedCleared, clearedEntries, tt.description)
+		})
+	}
+}
+
+// TestSetNodesAutogroupSelfUnhydratedUser reproduces the panic seen on
+// /machine/map when an autogroup:self policy is active and a non-tagged
+// node reaches the policy manager with its UserID set but the User
+// association left unhydrated (User pointer nil). The NodeStore stores
+// nodes by value with User as a *User; not every write path hydrates the
+// association, so the autogroup:self cache invalidation must derive the
+// owning user from UserID, not from the User view.
+func TestSetNodesAutogroupSelfUnhydratedUser(t *testing.T) {
+	users := types.Users{
+		{ID: 1, Name: "user1", Email: "user1@headscale.net"},
+		{ID: 2, Name: "user2", Email: "user2@headscale.net"},
+	}
+
+	policy := `{
+		"acls": [
+			{
+				"action": "accept",
+				"src": ["autogroup:member"],
+				"dst": ["autogroup:self:*"]
+			}
+		]
+	}`
+
+	// unhydratedNode mirrors a NodeStore snapshot entry whose UserID is
+	// set (so it is unambiguously user-owned, not tagged) but whose User
+	// association was never loaded.
+	unhydratedNode := func(name, ipv4, ipv6 string, userID uint) *types.Node {
+		return &types.Node{
+			Hostname: name,
+			IPv4:     ap(ipv4),
+			IPv6:     ap(ipv6),
+			UserID:   new(userID),
+			User:     nil,
+		}
+	}
+
+	initialNodes := types.Nodes{
+		node("user1-node1", "100.64.0.1", "fd7a:115c:a1e0::1", users[0]),
+		node("user2-node1", "100.64.0.2", "fd7a:115c:a1e0::2", users[1]),
+	}
+	for i, n := range initialNodes {
+		n.ID = types.NodeID(i + 1) //nolint:gosec // safe conversion in test
+	}
+
+	pm, err := NewPolicyManager([]byte(policy), users, initialNodes.ViewSlice())
+	require.NoError(t, err)
+
+	require.False(t, initialNodes[0].IsTagged(), "node must be user-owned for autogroup:self")
+
+	// Simulate a node restarting tailscaled: the same node is pushed back
+	// into the policy manager, but the snapshot version has no hydrated
+	// User association. This is the exact shape that crashed beta.1.
+	updatedNodes := types.Nodes{
+		unhydratedNode("user1-node1", "100.64.0.1", "fd7a:115c:a1e0::1", users[0].ID),
+		node("user2-node1", "100.64.0.2", "fd7a:115c:a1e0::2", users[1]),
+	}
+	for i, n := range updatedNodes {
+		n.ID = types.NodeID(i + 1) //nolint:gosec // safe conversion in test
+	}
+
+	require.NotPanics(t, func() {
+		_, err = pm.SetNodes(updatedNodes.ViewSlice())
+	}, "SetNodes must not panic when a non-tagged node has an unhydrated User")
+	require.NoError(t, err)
+}
+
+// TestSSHCheckParamsUnhydratedUserNoPanic proves that SSHCheckParams does
+// not panic when a non-tagged node reaches the policy manager with its
+// UserID set but its User association unhydrated (User pointer nil) — the
+// same NodeStore shape that crashed /machine/map in commit 171fd7a3. The
+// autogroup:self SSH branch dereferences node.User().ID() guarded only by
+// !IsTagged(), not by User().Valid(); SSHCheckParams is reached from the
+// Noise SSH-check path (noise.go), so a tailnet client triggers the panic
+// and crashes the server (DoS) whenever an SSH check rule with an
+// autogroup:self destination is active.
+func TestSSHCheckParamsUnhydratedUserNoPanic(t *testing.T) {
+	users := types.Users{
+		{ID: 1, Name: "user1", Email: "user1@headscale.net"},
+	}
+
+	policy := `{
+		"ssh": [
+			{
+				"action": "check",
+				"src":    ["user1@headscale.net"],
+				"dst":    ["autogroup:self"],
+				"users":  ["root"]
+			}
+		]
+	}`
+
+	initialNodes := types.Nodes{
+		node("user1-src", "100.64.0.1", "fd7a:115c:a1e0::1", users[0]),
+		node("user1-dst", "100.64.0.2", "fd7a:115c:a1e0::2", users[0]),
+	}
+	for i, n := range initialNodes {
+		n.ID = types.NodeID(i + 1) //nolint:gosec // safe conversion in test
+	}
+
+	pm, err := NewPolicyManager([]byte(policy), users, initialNodes.ViewSlice())
+	require.NoError(t, err)
+
+	// Simulate a node restarting tailscaled: the destination node is pushed
+	// back into the policy manager with no hydrated User association (UserID
+	// set, User pointer nil), the exact shape that crashed beta.1.
+	unhydratedDst := &types.Node{
+		ID:       2,
+		Hostname: "user1-dst",
+		IPv4:     ap("100.64.0.2"),
+		IPv6:     ap("fd7a:115c:a1e0::2"),
+		UserID:   new(users[0].ID),
+		User:     nil,
+	}
+	require.False(t, unhydratedDst.IsTagged(), "dst node must be user-owned for autogroup:self")
+
+	updatedNodes := types.Nodes{
+		node("user1-src", "100.64.0.1", "fd7a:115c:a1e0::1", users[0]),
+		unhydratedDst,
+	}
+	updatedNodes[0].ID = 1
+	_, err = pm.SetNodes(updatedNodes.ViewSlice())
+	require.NoError(t, err)
+
+	require.NotPanics(t, func() {
+		pm.SSHCheckParams(types.NodeID(1), types.NodeID(2))
+	}, "SSHCheckParams must not panic when a non-tagged node has an unhydrated User")
+}
+
+func TestSetUsers(t *testing.T) {
+	const allowAll = `{"acls":[{"action":"accept","src":["*"],"dst":["*:*"]}]}`
+
+	const sshCheck = `{
+		"ssh": [
+			{
+				"action": "check",
+				"src": ["user1@headscale.net"],
+				"dst": ["autogroup:self"],
+				"users": ["root"]
+			}
+		]
+	}`
+
+	tests := []struct {
+		name   string
+		policy string
+		mutate func(*types.User)
+
+		wantPolicyChanged  bool
+		wantPeerMapChanged bool
+	}{
+		{
+			name:   "identical users without ssh",
+			policy: allowAll,
+			mutate: func(*types.User) {},
+		},
+		{
+			name:   "identical users with ssh",
+			policy: sshCheck,
+			mutate: func(*types.User) {},
+		},
+		{
+			name:   "timestamp bump only",
+			policy: sshCheck,
+			mutate: func(u *types.User) { u.UpdatedAt = u.UpdatedAt.Add(time.Hour) },
+		},
+		{
+			name:   "display name change without ssh",
+			policy: allowAll,
+			mutate: func(u *types.User) { u.DisplayName = "Renamed" },
+		},
+		{
+			name:   "email change without ssh",
+			policy: allowAll,
+			mutate: func(u *types.User) { u.Email = "other@headscale.net" },
+
+			wantPeerMapChanged: true,
+		},
+		{
+			name:   "rename with ssh",
+			policy: sshCheck,
+			mutate: func(u *types.User) { u.Name = "renamed" },
+
+			wantPolicyChanged:  true,
+			wantPeerMapChanged: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			users := types.Users{{ID: 1, Name: "user1", Email: "user1@headscale.net"}}
+
+			pm, err := NewPolicyManager([]byte(tt.policy), users, types.Nodes{}.ViewSlice())
+			require.NoError(t, err)
+
+			updated := slices.Clone(users)
+			tt.mutate(&updated[0])
+
+			policyChanged, peerMapChanged, err := pm.SetUsers(updated)
+			require.NoError(t, err)
+			require.Equal(t, tt.wantPolicyChanged, policyChanged, "policyChanged")
+			require.Equal(t, tt.wantPeerMapChanged, peerMapChanged, "peerMapChanged")
 		})
 	}
 }
@@ -355,16 +577,19 @@ func TestInvalidateGlobalPolicyCache(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			pm := &PolicyManager{
-				nodes:             tt.oldNodes.ViewSlice(),
-				filterRulesMap:    tt.initialCache,
-				usesAutogroupSelf: false,
+				nodes:              tt.oldNodes.ViewSlice(),
+				filterRulesMap:     xsync.NewMap[types.NodeID, []tailcfg.FilterRule](),
+				matchersForNodeMap: xsync.NewMap[types.NodeID, []matcher.Match](),
+			}
+			for id, rules := range tt.initialCache {
+				pm.filterRulesMap.Store(id, rules)
 			}
 
 			pm.invalidateGlobalPolicyCache(tt.newNodes.ViewSlice())
 
 			// Verify cache state
 			for nodeID, shouldExist := range tt.expectedCacheAfter {
-				_, exists := pm.filterRulesMap[nodeID]
+				_, exists := pm.filterRulesMap.Load(nodeID)
 				require.Equal(t, shouldExist, exists, "node %d cache existence mismatch", nodeID)
 			}
 		})
@@ -375,8 +600,8 @@ func TestInvalidateGlobalPolicyCache(t *testing.T) {
 // 1. BuildPeerMap uses unreduced compiled rules for determining peer relationships
 // 2. FilterForNode returns reduced compiled rules for packet filters.
 func TestAutogroupSelfReducedVsUnreducedRules(t *testing.T) {
-	user1 := types.User{Model: gorm.Model{ID: 1}, Name: "user1", Email: "user1@headscale.net"}
-	user2 := types.User{Model: gorm.Model{ID: 2}, Name: "user2", Email: "user2@headscale.net"}
+	user1 := types.User{ID: 1, Name: "user1", Email: "user1@headscale.net"}
+	user2 := types.User{ID: 2, Name: "user2", Email: "user2@headscale.net"}
 	users := types.Users{user1, user2}
 
 	// Create two nodes
@@ -399,7 +624,7 @@ func TestAutogroupSelfReducedVsUnreducedRules(t *testing.T) {
 
 	pm, err := NewPolicyManager([]byte(policyStr), users, nodes.ViewSlice())
 	require.NoError(t, err)
-	require.True(t, pm.usesAutogroupSelf, "policy should use autogroup:self")
+	require.True(t, pm.needsPerNodeFilter, "policy should need per-node filter")
 
 	// Test FilterForNode returns reduced rules
 	// For node1: should have rules where node1 is in destinations (its own IP)
@@ -452,8 +677,8 @@ func TestAutogroupSelfReducedVsUnreducedRules(t *testing.T) {
 // This ensures that autogroup:self doesn't interfere with other ACL rules.
 func TestAutogroupSelfWithOtherRules(t *testing.T) {
 	users := types.Users{
-		{Model: gorm.Model{ID: 1}, Name: "test-1", Email: "test-1@example.com"},
-		{Model: gorm.Model{ID: 2}, Name: "test-2", Email: "test-2@example.com"},
+		{ID: 1, Name: "test-1", Email: "test-1@example.com"},
+		{ID: 2, Name: "test-2", Email: "test-2@example.com"},
 	}
 
 	// test-1 has a regular device
@@ -516,9 +741,8 @@ func TestAutogroupSelfWithOtherRules(t *testing.T) {
 	test1Peers := peerMap[test1Node.ID]
 
 	// Verify test-1 can see the router (group:home -> tag:node-router rule)
-	require.True(t, slices.ContainsFunc(test1Peers, func(n types.NodeView) bool {
-		return n.ID() == test2RouterNode.ID
-	}), "test-1 should see test-2's router via group:home -> tag:node-router rule, even when autogroup:self rule exists (issue #2838)")
+	require.True(t, slices.Contains(test1Peers, test2RouterNode.ID),
+		"test-1 should see test-2's router via group:home -> tag:node-router rule, even when autogroup:self rule exists (issue #2838)")
 
 	// Verify that test-1 has filter rules (including autogroup:self and tag:node-router access)
 	rules, err := pm.FilterForNode(test1Node.View())
@@ -533,8 +757,8 @@ func TestAutogroupSelfWithOtherRules(t *testing.T) {
 // leaving nodes with stale filter rules until reconnect.
 func TestAutogroupSelfPolicyUpdateTriggersMapResponse(t *testing.T) {
 	users := types.Users{
-		{Model: gorm.Model{ID: 1}, Name: "test-1", Email: "test-1@example.com"},
-		{Model: gorm.Model{ID: 2}, Name: "test-2", Email: "test-2@example.com"},
+		{ID: 1, Name: "test-1", Email: "test-1@example.com"},
+		{ID: 2, Name: "test-2", Email: "test-2@example.com"},
 	}
 
 	test1Node := &types.Node{
@@ -572,7 +796,7 @@ func TestAutogroupSelfPolicyUpdateTriggersMapResponse(t *testing.T) {
 
 	pm, err := NewPolicyManager([]byte(initialPolicy), users, nodes.ViewSlice())
 	require.NoError(t, err)
-	require.True(t, pm.usesAutogroupSelf, "policy should use autogroup:self")
+	require.True(t, pm.needsPerNodeFilter, "policy should need per-node filter")
 
 	// Get initial filter rules for test-1 (should be cached)
 	rules1, err := pm.FilterForNode(test1Node.View())
@@ -617,8 +841,8 @@ func TestAutogroupSelfPolicyUpdateTriggersMapResponse(t *testing.T) {
 // https://github.com/juanfont/headscale/issues/2389
 func TestTagPropagationToPeerMap(t *testing.T) {
 	users := types.Users{
-		{Model: gorm.Model{ID: 1}, Name: "user1", Email: "user1@headscale.net"},
-		{Model: gorm.Model{ID: 2}, Name: "user2", Email: "user2@headscale.net"},
+		{ID: 1, Name: "user1", Email: "user1@headscale.net"},
+		{ID: 2, Name: "user2", Email: "user2@headscale.net"},
 	}
 
 	// Policy: user2 can access tag:web nodes
@@ -678,12 +902,12 @@ func TestTagPropagationToPeerMap(t *testing.T) {
 	// Check user2's peers - should include user1
 	user2Peers := initialPeerMap[user2Node.ID]
 	require.Len(t, user2Peers, 1, "user2 should have 1 peer initially (user1 with tag:web)")
-	require.Equal(t, user1Node.ID, user2Peers[0].ID(), "user2's peer should be user1")
+	require.Equal(t, user1Node.ID, user2Peers[0], "user2's peer should be user1")
 
 	// Check user1's peers - should include user2 (bidirectional ACL)
 	user1Peers := initialPeerMap[user1Node.ID]
 	require.Len(t, user1Peers, 1, "user1 should have 1 peer initially (user2)")
-	require.Equal(t, user2Node.ID, user1Peers[0].ID(), "user1's peer should be user2")
+	require.Equal(t, user2Node.ID, user1Peers[0], "user1's peer should be user2")
 
 	// Now change user1's tags: remove tag:web, keep only tag:internal
 	user1NodeUpdated := &types.Node{
@@ -721,10 +945,11 @@ func TestTagPropagationToPeerMap(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEmpty(t, matchersForUser2, "MatchersForNode should return non-empty matchers (at least self-access rule)")
 
-	// Test ReduceNodes logic with the updated nodes and matchers
-	// This is what buildTailPeers does - it takes peers from ListPeers (which might include user1)
-	// and filters them using ReduceNodes with the updated matchers
-	// Inline the ReduceNodes logic to avoid import cycle
+	// Test [policy.ReduceNodes] logic with the updated nodes and matchers
+	// This is what [mapper.MapResponseBuilder.buildTailPeers] does - it takes peers from
+	// [state.State.ListPeers] (which might include user1) and filters them using
+	// [policy.ReduceNodes] with the updated matchers
+	// Inline the [policy.ReduceNodes] logic to avoid import cycle
 	user2View := user2Node.View()
 	user1UpdatedView := user1NodeUpdated.View()
 
@@ -744,8 +969,8 @@ func TestTagPropagationToPeerMap(t *testing.T) {
 // BOTH admin and tagged node should see each other as peers.
 func TestAutogroupSelfWithAdminOverride(t *testing.T) {
 	users := types.Users{
-		{Model: gorm.Model{ID: 1}, Name: "admin", Email: "admin@example.com"},
-		{Model: gorm.Model{ID: 2}, Name: "user1", Email: "user1@example.com"},
+		{ID: 1, Name: "admin", Email: "admin@example.com"},
+		{ID: 2, Name: "user1", Email: "user1@example.com"},
 	}
 
 	// Admin has a regular device
@@ -809,17 +1034,15 @@ func TestAutogroupSelfWithAdminOverride(t *testing.T) {
 
 	// Admin should see the tagged server as a peer (via group:admin -> *:* rule)
 	adminPeers := peerMap[adminNode.ID]
-	require.True(t, slices.ContainsFunc(adminPeers, func(n types.NodeView) bool {
-		return n.ID() == user1TaggedNode.ID
-	}), "admin should see tagged server as peer via *:* rule (issue #2990)")
+	require.True(t, slices.Contains(adminPeers, user1TaggedNode.ID),
+		"admin should see tagged server as peer via *:* rule (issue #2990)")
 
 	// Tagged server should also see admin as a peer (symmetric visibility)
 	// Even though tagged server cannot ACCESS admin, it should still SEE admin
 	// because admin CAN access it. This is required for proper network operation.
 	taggedPeers := peerMap[user1TaggedNode.ID]
-	require.True(t, slices.ContainsFunc(taggedPeers, func(n types.NodeView) bool {
-		return n.ID() == adminNode.ID
-	}), "tagged server should see admin as peer (symmetric visibility)")
+	require.True(t, slices.Contains(taggedPeers, adminNode.ID),
+		"tagged server should see admin as peer (symmetric visibility)")
 }
 
 // TestAutogroupSelfSymmetricVisibility verifies that peer visibility is symmetric:
@@ -827,8 +1050,8 @@ func TestAutogroupSelfWithAdminOverride(t *testing.T) {
 // This is the same behavior as the global filter path.
 func TestAutogroupSelfSymmetricVisibility(t *testing.T) {
 	users := types.Users{
-		{Model: gorm.Model{ID: 1}, Name: "user1", Email: "user1@example.com"},
-		{Model: gorm.Model{ID: 2}, Name: "user2", Email: "user2@example.com"},
+		{ID: 1, Name: "user1", Email: "user1@example.com"},
+		{ID: 2, Name: "user2", Email: "user2@example.com"},
 	}
 
 	// user1 has device A
@@ -882,16 +1105,14 @@ func TestAutogroupSelfSymmetricVisibility(t *testing.T) {
 
 	// Device A (user1) should see device B (tag:web) as peer
 	aPeers := peerMap[deviceA.ID]
-	require.True(t, slices.ContainsFunc(aPeers, func(n types.NodeView) bool {
-		return n.ID() == deviceB.ID
-	}), "device A should see device B as peer (user1 -> tag:web rule)")
+	require.True(t, slices.Contains(aPeers, deviceB.ID),
+		"device A should see device B as peer (user1 -> tag:web rule)")
 
 	// Device B (tag:web) should ALSO see device A as peer (symmetric visibility)
 	// Even though B cannot ACCESS A, B should still SEE A as a peer
 	bPeers := peerMap[deviceB.ID]
-	require.True(t, slices.ContainsFunc(bPeers, func(n types.NodeView) bool {
-		return n.ID() == deviceA.ID
-	}), "device B should see device A as peer (symmetric visibility)")
+	require.True(t, slices.Contains(bPeers, deviceA.ID),
+		"device B should see device A as peer (symmetric visibility)")
 }
 
 // TestAutogroupSelfDoesNotBreakOtherUsersAccess reproduces the Discord scenario
@@ -910,10 +1131,10 @@ func TestAutogroupSelfSymmetricVisibility(t *testing.T) {
 // - All tagged nodes should be visible to users who can access them.
 func TestAutogroupSelfDoesNotBreakOtherUsersAccess(t *testing.T) {
 	users := types.Users{
-		{Model: gorm.Model{ID: 1}, Name: "superadmin", Email: "superadmin@example.com"},
-		{Model: gorm.Model{ID: 2}, Name: "admin", Email: "admin@example.com"},
-		{Model: gorm.Model{ID: 3}, Name: "direction", Email: "direction@example.com"},
-		{Model: gorm.Model{ID: 4}, Name: "tagowner", Email: "tagowner@example.com"},
+		{ID: 1, Name: "superadmin", Email: "superadmin@example.com"},
+		{ID: 2, Name: "admin", Email: "admin@example.com"},
+		{ID: 3, Name: "direction", Email: "direction@example.com"},
+		{ID: 4, Name: "tagowner", Email: "tagowner@example.com"},
 	}
 
 	// Create nodes:
@@ -1027,11 +1248,7 @@ func TestAutogroupSelfDoesNotBreakOtherUsersAccess(t *testing.T) {
 
 	// Helper to check if node A sees node B
 	canSee := func(a, b types.NodeID) bool {
-		peers := peerMap[a]
-
-		return slices.ContainsFunc(peers, func(n types.NodeView) bool {
-			return n.ID() == b
-		})
+		return slices.Contains(peerMap[a], b)
 	}
 
 	// Superadmin should see all tagged servers
@@ -1080,8 +1297,8 @@ func TestAutogroupSelfDoesNotBreakOtherUsersAccess(t *testing.T) {
 // visible to nodes that can access them.
 func TestEmptyFilterNodesStillVisible(t *testing.T) {
 	users := types.Users{
-		{Model: gorm.Model{ID: 1}, Name: "admin", Email: "admin@example.com"},
-		{Model: gorm.Model{ID: 2}, Name: "tagowner", Email: "tagowner@example.com"},
+		{ID: 1, Name: "admin", Email: "admin@example.com"},
+		{ID: 2, Name: "tagowner", Email: "tagowner@example.com"},
 	}
 
 	adminDevice := &types.Node{
@@ -1131,16 +1348,14 @@ func TestEmptyFilterNodesStillVisible(t *testing.T) {
 
 	// Admin should see the tagged server
 	adminPeers := peerMap[adminDevice.ID]
-	require.True(t, slices.ContainsFunc(adminPeers, func(n types.NodeView) bool {
-		return n.ID() == taggedServer.ID
-	}), "admin should see tagged server")
+	require.True(t, slices.Contains(adminPeers, taggedServer.ID),
+		"admin should see tagged server")
 
 	// Tagged server should see admin (symmetric visibility)
 	// Even though the server has no outbound rules (empty filter)
 	serverPeers := peerMap[taggedServer.ID]
-	require.True(t, slices.ContainsFunc(serverPeers, func(n types.NodeView) bool {
-		return n.ID() == adminDevice.ID
-	}), "tagged server should see admin (symmetric visibility)")
+	require.True(t, slices.Contains(serverPeers, adminDevice.ID),
+		"tagged server should see admin (symmetric visibility)")
 }
 
 // TestAutogroupSelfCombinedWithTags verifies that autogroup:self combined with
@@ -1148,8 +1363,8 @@ func TestEmptyFilterNodesStillVisible(t *testing.T) {
 // tagged nodes AND their own devices.
 func TestAutogroupSelfCombinedWithTags(t *testing.T) {
 	users := types.Users{
-		{Model: gorm.Model{ID: 1}, Name: "admin", Email: "admin@example.com"},
-		{Model: gorm.Model{ID: 2}, Name: "tagowner", Email: "tagowner@example.com"},
+		{ID: 1, Name: "admin", Email: "admin@example.com"},
+		{ID: 2, Name: "tagowner", Email: "tagowner@example.com"},
 	}
 
 	// Admin has two devices
@@ -1208,11 +1423,7 @@ func TestAutogroupSelfCombinedWithTags(t *testing.T) {
 
 	// Helper to check visibility
 	canSee := func(a, b types.NodeID) bool {
-		peers := peerMap[a]
-
-		return slices.ContainsFunc(peers, func(n types.NodeView) bool {
-			return n.ID() == b
-		})
+		return slices.Contains(peerMap[a], b)
 	}
 
 	// Admin laptop should see: admin phone (autogroup:self) AND web server (tag:web)
@@ -1244,7 +1455,7 @@ func TestAutogroupSelfCombinedWithTags(t *testing.T) {
 // Expected: node1 should be able to reach node2 via group:admin -> *:* rule.
 func TestIssue2990SameUserTaggedDevice(t *testing.T) {
 	users := types.Users{
-		{Model: gorm.Model{ID: 1}, Name: "user1", Email: "user1@"},
+		{ID: 1, Name: "user1", Email: "user1@"},
 	}
 
 	// node1: user device (not tagged), belongs to user1
@@ -1301,11 +1512,7 @@ func TestIssue2990SameUserTaggedDevice(t *testing.T) {
 	peerMap := pm.BuildPeerMap(nodes.ViewSlice())
 
 	canSee := func(a, b types.NodeID) bool {
-		peers := peerMap[a]
-
-		return slices.ContainsFunc(peers, func(n types.NodeView) bool {
-			return n.ID() == b
-		})
+		return slices.Contains(peerMap[a], b)
 	}
 
 	// node1 should see node2 (via group:admin -> *:* and symmetric visibility)
@@ -1344,8 +1551,8 @@ func TestViaRoutesForPeer(t *testing.T) {
 	t.Parallel()
 
 	users := types.Users{
-		{Model: gorm.Model{ID: 1}, Name: "user1", Email: "user1@"},
-		{Model: gorm.Model{ID: 2}, Name: "user2", Email: "user2@"},
+		{ID: 1, Name: "user1", Email: "user1@"},
+		{ID: 2, Name: "user2", Email: "user2@"},
 	}
 
 	t.Run("self_returns_empty", func(t *testing.T) {
@@ -1626,10 +1833,14 @@ func TestViaRoutesForPeer(t *testing.T) {
 		require.NoError(t, err)
 
 		result := pm.ViaRoutesForPeer(nodes[0].View(), nodes[1].View())
-		// Include should have only the subnet route.
-		// autogroup:internet does not produce via route effects.
+		// Include contains the subnet route plus the peer's approved
+		// exit routes — the peer holds tag:router and advertises exit
+		// routes, so autogroup:internet steering applies alongside the
+		// explicit prefix.
 		require.Contains(t, result.Include, mp("10.0.0.0/24"))
-		require.Len(t, result.Include, 1)
+		require.Contains(t, result.Include, mp("0.0.0.0/0"))
+		require.Contains(t, result.Include, mp("::/0"))
+		require.Len(t, result.Include, 3)
 		require.Empty(t, result.Exclude)
 	})
 
@@ -1699,17 +1910,20 @@ func TestViaRoutesForPeer(t *testing.T) {
 		pm, err := NewPolicyManager([]byte(pol), users, nodes.ViewSlice())
 		require.NoError(t, err)
 
-		// autogroup:internet via grants do NOT affect AllowedIPs or
-		// route steering. Tailscale SaaS handles exit traffic through
-		// the client's exit node mechanism, not ViaRoutesForPeer.
-		// Verified by golden captures GRANT-V14 through GRANT-V36.
+		// autogroup:internet via grants surface the peer's approved
+		// exit routes when the peer carries the via tag, and exclude
+		// them when it does not — restricting which exit nodes the
+		// viewer may use, per Tailscale's grants-via spec for
+		// autogroup:internet.
 		resultExit := pm.ViaRoutesForPeer(nodes[0].View(), nodes[1].View())
-		require.Empty(t, resultExit.Include)
+		require.Contains(t, resultExit.Include, mp("0.0.0.0/0"))
+		require.Contains(t, resultExit.Include, mp("::/0"))
 		require.Empty(t, resultExit.Exclude)
 
 		resultOther := pm.ViaRoutesForPeer(nodes[0].View(), nodes[2].View())
 		require.Empty(t, resultOther.Include)
-		require.Empty(t, resultOther.Exclude)
+		require.Contains(t, resultOther.Exclude, mp("0.0.0.0/0"))
+		require.Contains(t, resultOther.Exclude, mp("::/0"))
 	})
 
 	t.Run("via_routes_survive_reduce_routes", func(t *testing.T) {
@@ -1791,5 +2005,596 @@ func TestViaRoutesForPeer(t *testing.T) {
 		require.False(t, canAccess,
 			"client should NOT be able to access 10.0.0.0/24 via matchers alone; "+
 				"state.RoutesForPeer adds via routes after ReduceRoutes to fix this")
+	})
+
+	t.Run("broader_dst_includes_narrower_advertised_route", func(t *testing.T) {
+		t.Parallel()
+
+		nodes := types.Nodes{
+			{
+				ID:       1,
+				Hostname: "viewer",
+				IPv4:     ap("100.64.0.1"),
+				User:     new(users[0]),
+				UserID:   new(users[0].ID),
+				Hostinfo: &tailcfg.Hostinfo{},
+			},
+			{
+				ID:       2,
+				Hostname: "router",
+				IPv4:     ap("100.64.0.2"),
+				User:     new(users[0]),
+				UserID:   new(users[0].ID),
+				Tags:     []string{"tag:router"},
+				Hostinfo: &tailcfg.Hostinfo{
+					RoutableIPs: []netip.Prefix{mp("10.33.5.0/24")},
+				},
+				ApprovedRoutes: []netip.Prefix{mp("10.33.5.0/24")},
+			},
+		}
+
+		pol := `{
+			"tagOwners": {
+				"tag:router": ["user1@"]
+			},
+			"grants": [{
+				"src": ["user1@"],
+				"dst": ["10.0.0.0/8"],
+				"ip": ["*"],
+				"via": ["tag:router"]
+			}]
+		}`
+
+		pm, err := NewPolicyManager([]byte(pol), users, nodes.ViewSlice())
+		require.NoError(t, err)
+
+		result := pm.ViaRoutesForPeer(nodes[0].View(), nodes[1].View())
+		require.Equal(t, []netip.Prefix{mp("10.33.5.0/24")}, result.Include,
+			"Include must hold the advertised route /24, not the broader grant dst /8")
+		require.Empty(t, result.Exclude)
+	})
+
+	t.Run("narrower_dst_includes_advertised_route", func(t *testing.T) {
+		t.Parallel()
+
+		nodes := types.Nodes{
+			{
+				ID:       1,
+				Hostname: "viewer",
+				IPv4:     ap("100.64.0.1"),
+				User:     new(users[0]),
+				UserID:   new(users[0].ID),
+				Hostinfo: &tailcfg.Hostinfo{},
+			},
+			{
+				ID:       2,
+				Hostname: "router",
+				IPv4:     ap("100.64.0.2"),
+				User:     new(users[0]),
+				UserID:   new(users[0].ID),
+				Tags:     []string{"tag:router"},
+				Hostinfo: &tailcfg.Hostinfo{
+					RoutableIPs: []netip.Prefix{mp("10.33.0.0/16")},
+				},
+				ApprovedRoutes: []netip.Prefix{mp("10.33.0.0/16")},
+			},
+		}
+
+		pol := `{
+			"tagOwners": {
+				"tag:router": ["user1@"]
+			},
+			"grants": [{
+				"src": ["user1@"],
+				"dst": ["10.33.5.0/24"],
+				"ip": ["*"],
+				"via": ["tag:router"]
+			}]
+		}`
+
+		pm, err := NewPolicyManager([]byte(pol), users, nodes.ViewSlice())
+		require.NoError(t, err)
+
+		result := pm.ViaRoutesForPeer(nodes[0].View(), nodes[1].View())
+		require.Equal(t, []netip.Prefix{mp("10.33.0.0/16")}, result.Include,
+			"Include must hold the advertised route /16 that covers the narrower grant dst /24")
+		require.Empty(t, result.Exclude)
+	})
+
+	t.Run("disjoint_dst_emits_nothing", func(t *testing.T) {
+		t.Parallel()
+
+		nodes := types.Nodes{
+			{
+				ID:       1,
+				Hostname: "viewer",
+				IPv4:     ap("100.64.0.1"),
+				User:     new(users[0]),
+				UserID:   new(users[0].ID),
+				Hostinfo: &tailcfg.Hostinfo{},
+			},
+			{
+				ID:       2,
+				Hostname: "router",
+				IPv4:     ap("100.64.0.2"),
+				User:     new(users[0]),
+				UserID:   new(users[0].ID),
+				Tags:     []string{"tag:router"},
+				Hostinfo: &tailcfg.Hostinfo{
+					RoutableIPs: []netip.Prefix{mp("10.33.0.0/16")},
+				},
+				ApprovedRoutes: []netip.Prefix{mp("10.33.0.0/16")},
+			},
+		}
+
+		pol := `{
+			"tagOwners": {
+				"tag:router": ["user1@"]
+			},
+			"grants": [{
+				"src": ["user1@"],
+				"dst": ["192.168.0.0/16"],
+				"ip": ["*"],
+				"via": ["tag:router"]
+			}]
+		}`
+
+		pm, err := NewPolicyManager([]byte(pol), users, nodes.ViewSlice())
+		require.NoError(t, err)
+
+		result := pm.ViaRoutesForPeer(nodes[0].View(), nodes[1].View())
+		require.Empty(t, result.Include,
+			"disjoint dst must produce nothing — the via gate requires advertised-route overlap")
+		require.Empty(t, result.Exclude)
+	})
+}
+
+// TestBuildPeerMap_AutogroupInternetMakesExitNodeVisible reproduces
+// juanfont/headscale#3212. An ACL that grants access only via
+// `autogroup:internet` must keep the exit node visible to the source
+// in BuildPeerMap so the Tailscale client surfaces it in
+// `tailscale exit-node list`. Authoritative SaaS captures
+// (routes-b17/b18, 2026-04-28) confirm SaaS includes the exit node
+// in the source's Peers with 0.0.0.0/0 and ::/0 in AllowedIPs.
+func TestBuildPeerMap_AutogroupInternetMakesExitNodeVisible(t *testing.T) {
+	t.Parallel()
+
+	users := types.Users{
+		{ID: 1, Name: "alice", Email: "alice@headscale.net"},
+	}
+
+	aliceNode := node("alice-laptop", "100.64.0.10", "fd7a:115c:a1e0::a", users[0])
+	aliceNode.ID = 1
+
+	exitRoutes := []netip.Prefix{tsaddr.AllIPv4(), tsaddr.AllIPv6()}
+	exitNode := node("alice-exit", "100.64.0.1", "fd7a:115c:a1e0::1", users[0])
+	exitNode.ID = 2
+	exitNode.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: exitRoutes}
+	exitNode.ApprovedRoutes = exitRoutes
+
+	nodes := types.Nodes{aliceNode, exitNode}
+
+	policy := `{
+		"acls": [
+			{"action": "accept", "src": ["alice@headscale.net"], "dst": ["autogroup:internet:*"]}
+		]
+	}`
+
+	pm, err := NewPolicyManager([]byte(policy), users, nodes.ViewSlice())
+	require.NoError(t, err)
+
+	peerMap := pm.BuildPeerMap(nodes.ViewSlice())
+
+	require.True(t,
+		slices.Contains(peerMap[aliceNode.ID], exitNode.ID),
+		"alice should see the exit node as a peer when an ACL grants autogroup:internet (#3212)")
+
+	_, matchers := pm.Filter()
+	require.True(t, aliceNode.View().CanAccess(matchers, exitNode.View()),
+		"alice.CanAccess(exit) should be true via DestsIsTheInternet()+IsExitNode() (#3212)")
+}
+
+// Reproduction for #3160: ambiguous user@ used to silently drop rules.
+func TestNewPolicyManager_DuplicateUsername(t *testing.T) {
+	users := types.Users{
+		{ID: 2, Name: "yala"},
+		{ID: 7, Name: "yala", Email: "yala@yala.yala"},
+	}
+
+	polB := []byte(`{
+  "groups":    {"group:admins": ["yala@"]},
+  "tagOwners": {"tag:ssh": ["group:admins"]},
+  "acls":      [{"action":"accept","src":["*"],"dst":["*:*"]}],
+  "ssh": [
+    {"action":"accept","src":["group:admins"],"dst":["tag:ssh"],"users":["root"]}
+  ]
+}`)
+
+	_, err := NewPolicyManager(polB, users, types.Nodes{}.ViewSlice())
+	require.Error(t, err, "NewPolicyManager must reject policy with ambiguous username")
+	require.ErrorIs(t, err, ErrMultipleUsersFound)
+	require.Contains(t, err.Error(), "yala@",
+		"error must name the offending token")
+}
+
+// Missing-user tokens stay tolerant per #2863; only multi-match blocks load.
+func TestNewPolicyManager_UnknownUsernameTolerant(t *testing.T) {
+	users := types.Users{
+		{ID: 1, Name: "alice"},
+	}
+
+	polB := []byte(`{
+  "acls": [{"action":"accept","src":["ghost@"],"dst":["*:*"]}]
+}`)
+
+	_, err := NewPolicyManager(polB, users, types.Nodes{}.ViewSlice())
+	require.NoError(t, err, "missing-user references must not block policy load (#2863)")
+}
+
+// Rejected SetPolicy must keep the previous policy intact.
+func TestSetPolicy_DuplicateUsername(t *testing.T) {
+	users := types.Users{
+		{ID: 2, Name: "yala"},
+		{ID: 7, Name: "yala", Email: "yala@yala.yala"},
+	}
+
+	good := []byte(`{
+  "acls": [{"action":"accept","src":["*"],"dst":["*:*"]}]
+}`)
+
+	pm, err := NewPolicyManager(good, users, types.Nodes{}.ViewSlice())
+	require.NoError(t, err)
+
+	bad := []byte(`{
+  "groups": {"group:admins": ["yala@"]},
+  "acls":   [{"action":"accept","src":["group:admins"],"dst":["*:*"]}]
+}`)
+
+	_, err = pm.SetPolicy(bad)
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrMultipleUsersFound)
+
+	filter, _ := pm.Filter()
+	require.NotNil(t, filter, "filter must remain populated after rejected SetPolicy")
+}
+
+// Empty users → syntax-only check, used by `headscale policy check`.
+func TestValidateUserReferences_EmptyUsersTolerant(t *testing.T) {
+	polB := []byte(`{
+  "groups":    {"group:admins": ["yala@"]},
+  "tagOwners": {"tag:ssh": ["group:admins"]},
+  "acls":      [{"action":"accept","src":["yala@"],"dst":["*:*"]}],
+  "ssh": [
+    {"action":"accept","src":["yala@"],"dst":["tag:ssh"],"users":["root"]}
+  ]
+}`)
+
+	_, err := NewPolicyManager(polB, nil, types.Nodes{}.ViewSlice())
+	require.NoError(t, err, "nil users must skip user-reference validation")
+
+	_, err = NewPolicyManager(polB, types.Users{}, types.Nodes{}.ViewSlice())
+	require.NoError(t, err, "empty users must skip user-reference validation")
+}
+
+// One case per AST site so a dropped walk fails the matching subtest.
+func TestValidateUserReferences_AllSites(t *testing.T) {
+	users := types.Users{
+		{ID: 1, Name: "alice"},
+		{ID: 2, Name: "dup"},
+		{ID: 3, Name: "dup"},
+	}
+
+	tests := []struct {
+		name string
+		pol  string
+	}{
+		{
+			name: "groups",
+			pol: `{
+  "groups": {"group:admins": ["dup@"]},
+  "acls":   [{"action":"accept","src":["group:admins"],"dst":["*:*"]}]
+}`,
+		},
+		{
+			name: "tagOwners",
+			pol: `{
+  "tagOwners": {"tag:ssh": ["dup@"]},
+  "acls":      [{"action":"accept","src":["*"],"dst":["*:*"]}]
+}`,
+		},
+		{
+			name: "autoApprovers.routes",
+			pol: `{
+  "autoApprovers": {"routes": {"10.0.0.0/8": ["dup@"]}},
+  "acls":          [{"action":"accept","src":["*"],"dst":["*:*"]}]
+}`,
+		},
+		{
+			name: "autoApprovers.exitNode",
+			pol: `{
+  "autoApprovers": {"exitNode": ["dup@"]},
+  "acls":          [{"action":"accept","src":["*"],"dst":["*:*"]}]
+}`,
+		},
+		{
+			name: "acls.src",
+			pol: `{
+  "acls": [{"action":"accept","src":["dup@"],"dst":["*:*"]}]
+}`,
+		},
+		{
+			name: "acls.dst",
+			pol: `{
+  "acls": [{"action":"accept","src":["alice@"],"dst":["dup@:*"]}]
+}`,
+		},
+		{
+			name: "ssh.src",
+			pol: `{
+  "tagOwners": {"tag:ssh": ["alice@"]},
+  "acls":      [{"action":"accept","src":["*"],"dst":["*:*"]}],
+  "ssh": [{"action":"accept","src":["dup@"],"dst":["tag:ssh"],"users":["root"]}]
+}`,
+		},
+		{
+			// ErrSSHUserDestRequiresSameUser forces src==dst when dst is a user.
+			name: "ssh.dst",
+			pol: `{
+  "acls": [{"action":"accept","src":["*"],"dst":["*:*"]}],
+  "ssh": [{"action":"accept","src":["dup@"],"dst":["dup@"],"users":["root"]}]
+}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := NewPolicyManager([]byte(tt.pol), users, types.Nodes{}.ViewSlice())
+			require.Error(t, err, "site %q must surface duplicate-user errors", tt.name)
+			require.ErrorIs(t, err, ErrMultipleUsersFound)
+		})
+	}
+}
+
+// TestPeerRelayGrantMakesRelayVisible is a regression test for
+// https://github.com/juanfont/headscale/issues/3256.
+//
+// A grant that uses only `app: { "tailscale.com/cap/relay": [] }` must
+// make the relay node visible to the source nodes (and vice-versa).
+// Before the fix, MatchFromFilterRule only considered DstPorts as
+// destinations and ignored CapGrant.Dsts, so cap-grant-only rules
+// produced matchers with an empty destination set and BuildPeerMap
+// could not detect the cap-relay relationship.
+//
+// Sub-tests cover every alias shape documented for peer-relay grants
+// at https://tailscale.com/docs/features/peer-relay: tag→tag,
+// hostname→hostname (`hosts` block lookup), autogroup:member→hostname,
+// and a direct Tailscale-IP destination. Each must establish mutual
+// visibility between sources and the relay node without any companion
+// IP-level grant.
+func TestPeerRelayGrantMakesRelayVisible(t *testing.T) {
+	users := types.Users{
+		{ID: 1, Name: "alice", Email: "alice@headscale.net"},
+		{ID: 2, Name: "tagowner", Email: "tagowner@headscale.net"},
+	}
+
+	// Helper for tagged nodes belonging to the tag-owner user.
+	taggedNode := func(id types.NodeID, hostname, v4, v6 string, tags ...string) *types.Node {
+		return &types.Node{
+			ID:       id,
+			Hostname: hostname,
+			IPv4:     ap(v4),
+			IPv6:     ap(v6),
+			User:     new(users[1]),
+			UserID:   new(users[1].ID),
+			Tags:     tags,
+		}
+	}
+
+	userNode := func(id types.NodeID, hostname, v4, v6 string) *types.Node {
+		return &types.Node{
+			ID:       id,
+			Hostname: hostname,
+			IPv4:     ap(v4),
+			IPv6:     ap(v6),
+			User:     new(users[0]),
+			UserID:   new(users[0].ID),
+		}
+	}
+
+	tests := []struct {
+		name    string
+		nodes   types.Nodes
+		policy  string
+		srcIDs  []types.NodeID // expected to see the relay
+		relayID types.NodeID
+	}{
+		{
+			// Issue #3256 example: hosts block + autogroup:member src,
+			// hostname dst.
+			name: "hosts+autogroup_member src, hostname dst",
+			nodes: types.Nodes{
+				userNode(1, "n1", "100.64.0.1", "fd7a:115c:a1e0::1"),
+				userNode(2, "n2", "100.64.0.2", "fd7a:115c:a1e0::2"),
+				userNode(3, "peer-relay", "100.64.0.3", "fd7a:115c:a1e0::3"),
+			},
+			policy: `{
+				"hosts": {
+					"n1":         "100.64.0.1/32",
+					"n2":         "100.64.0.2/32",
+					"peer-relay": "100.64.0.3/32"
+				},
+				"grants": [
+					{"src": ["n1"], "dst": ["n2"], "ip": ["*"]},
+					{
+						"src": ["autogroup:member"],
+						"dst": ["peer-relay"],
+						"app": {"tailscale.com/cap/relay": []}
+					}
+				]
+			}`,
+			srcIDs:  []types.NodeID{1, 2},
+			relayID: 3,
+		},
+		{
+			// Tailscale docs example 1: tag → tag.
+			name: "tag src, tag dst",
+			nodes: types.Nodes{
+				taggedNode(1, "vpc-a", "100.64.0.1", "fd7a:115c:a1e0::1", "tag:us-east-vpc"),
+				taggedNode(2, "vpc-b", "100.64.0.2", "fd7a:115c:a1e0::2", "tag:us-east-vpc"),
+				taggedNode(3, "relay-1", "100.64.0.3", "fd7a:115c:a1e0::3", "tag:us-east-relays"),
+			},
+			policy: `{
+				"tagOwners": {
+					"tag:us-east-vpc":    ["tagowner@headscale.net"],
+					"tag:us-east-relays": ["tagowner@headscale.net"]
+				},
+				"grants": [
+					{
+						"src": ["tag:us-east-vpc"],
+						"dst": ["tag:us-east-relays"],
+						"app": {"tailscale.com/cap/relay": []}
+					}
+				]
+			}`,
+			srcIDs:  []types.NodeID{1, 2},
+			relayID: 3,
+		},
+		{
+			// Direct Tailscale-IP destination (no hosts alias).
+			name: "tag src, raw Tailscale IP dst",
+			nodes: types.Nodes{
+				taggedNode(1, "client-a", "100.64.0.1", "fd7a:115c:a1e0::1", "tag:client"),
+				taggedNode(2, "client-b", "100.64.0.2", "fd7a:115c:a1e0::2", "tag:client"),
+				userNode(3, "peer-relay", "100.64.0.3", "fd7a:115c:a1e0::3"),
+			},
+			policy: `{
+				"tagOwners": {
+					"tag:client": ["tagowner@headscale.net"]
+				},
+				"grants": [
+					{
+						"src": ["tag:client"],
+						"dst": ["100.64.0.3/32"],
+						"app": {"tailscale.com/cap/relay": []}
+					}
+				]
+			}`,
+			srcIDs:  []types.NodeID{1, 2},
+			relayID: 3,
+		},
+		{
+			// User → hostname relay using `hosts` aliasing.
+			name: "user src, hostname dst via hosts block",
+			nodes: types.Nodes{
+				userNode(1, "n1", "100.64.0.1", "fd7a:115c:a1e0::1"),
+				userNode(3, "peer-relay", "100.64.0.3", "fd7a:115c:a1e0::3"),
+			},
+			policy: `{
+				"hosts": {
+					"peer-relay": "100.64.0.3/32"
+				},
+				"grants": [
+					{
+						"src": ["alice@headscale.net"],
+						"dst": ["peer-relay"],
+						"app": {"tailscale.com/cap/relay": []}
+					}
+				]
+			}`,
+			srcIDs:  []types.NodeID{1},
+			relayID: 3,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pm, err := NewPolicyManager(
+				[]byte(tt.policy), users, tt.nodes.ViewSlice(),
+			)
+			require.NoError(t, err)
+
+			peerMap := pm.BuildPeerMap(tt.nodes.ViewSlice())
+
+			for _, srcID := range tt.srcIDs {
+				require.True(t, slices.Contains(peerMap[srcID], tt.relayID),
+					"node %d must see relay %d via cap/relay alone",
+					srcID, tt.relayID)
+				require.True(t, slices.Contains(peerMap[tt.relayID], srcID),
+					"relay %d must see node %d via cap/relay alone",
+					tt.relayID, srcID)
+			}
+		})
+	}
+}
+
+func TestTagOwnedByTags(t *testing.T) {
+	// tag:leaf is owned by tag:mid, which is owned by tag:root: a tag-to-tag
+	// delegation chain, the shape an operator token uses to mint narrower keys.
+	const policy = `{
+		"tagOwners": {
+			"tag:root": [],
+			"tag:mid":  ["tag:root"],
+			"tag:leaf": ["tag:mid"],
+			"tag:lone": []
+		},
+		"acls": [{"action": "accept", "src": ["*"], "dst": ["*:*"]}]
+	}`
+
+	pm, err := NewPolicyManager([]byte(policy), nil, types.Nodes{}.ViewSlice())
+	require.NoError(t, err)
+
+	tests := []struct {
+		name      string
+		tag       string
+		ownerTags []string
+		want      bool
+	}{
+		{
+			name:      "directly held tag needs no policy",
+			tag:       "tag:lone",
+			ownerTags: []string{"tag:lone"},
+			want:      true,
+		},
+		{
+			name:      "one-hop owned-by",
+			tag:       "tag:mid",
+			ownerTags: []string{"tag:root"},
+			want:      true,
+		},
+		{
+			name:      "transitive chain root owns leaf",
+			tag:       "tag:leaf",
+			ownerTags: []string{"tag:root"},
+			want:      true,
+		},
+		{
+			name:      "owning one link does not grant a sibling",
+			tag:       "tag:lone",
+			ownerTags: []string{"tag:root"},
+			want:      false,
+		},
+		{
+			name:      "unowned tag denied",
+			tag:       "tag:leaf",
+			ownerTags: []string{"tag:unrelated"},
+			want:      false,
+		},
+		{
+			name:      "empty owners deny a delegated tag",
+			tag:       "tag:leaf",
+			ownerTags: nil,
+			want:      false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.want, pm.TagOwnedByTags(tt.tag, tt.ownerTags))
+		})
+	}
+
+	t.Run("nil policy manager denies", func(t *testing.T) {
+		var nilPM *PolicyManager
+		require.False(t, nilPM.TagOwnedByTags("tag:leaf", []string{"tag:root"}))
 	})
 }

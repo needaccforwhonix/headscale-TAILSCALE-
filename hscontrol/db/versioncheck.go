@@ -3,6 +3,7 @@ package db
 import (
 	"errors"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -10,6 +11,7 @@ import (
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/rs/zerolog/log"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 var errVersionUpgrade = errors.New("version upgrade not supported")
@@ -65,26 +67,24 @@ func parseVersion(s string) (semver, error) {
 		return semver{}, fmt.Errorf("%q: %w", s, errVersionFormat)
 	}
 
-	major, err := strconv.Atoi(parts[0])
-	if err != nil {
-		return semver{}, fmt.Errorf("invalid major version in %q: %w", s, err)
+	var out [3]int
+
+	names := [...]string{"major", "minor", "patch"}
+
+	for i, p := range parts {
+		n, err := strconv.Atoi(p)
+		if err != nil {
+			return semver{}, fmt.Errorf("invalid %s version in %q: %w", names[i], s, err)
+		}
+
+		out[i] = n
 	}
 
-	minor, err := strconv.Atoi(parts[1])
-	if err != nil {
-		return semver{}, fmt.Errorf("invalid minor version in %q: %w", s, err)
-	}
-
-	patch, err := strconv.Atoi(parts[2])
-	if err != nil {
-		return semver{}, fmt.Errorf("invalid patch version in %q: %w", s, err)
-	}
-
-	return semver{Major: major, Minor: minor, Patch: patch}, nil
+	return semver{Major: out[0], Minor: out[1], Patch: out[2]}, nil
 }
 
 // ensureDatabaseVersionTable creates the database_versions table if it
-// does not already exist. Uses GORM AutoMigrate to handle dialect
+// does not already exist. Uses [gorm.DB.AutoMigrate] to handle dialect
 // differences between SQLite (datetime) and PostgreSQL (timestamp).
 // This runs before gormigrate migrations.
 func ensureDatabaseVersionTable(db *gorm.DB) error {
@@ -117,32 +117,60 @@ func getDatabaseVersion(db *gorm.DB) (string, error) {
 func setDatabaseVersion(db *gorm.DB, version string) error {
 	now := time.Now().UTC()
 
-	// Try update first, then insert if no rows affected.
-	result := db.Exec(
-		"UPDATE database_versions SET version = ?, updated_at = ? WHERE id = 1",
-		version, now,
-	)
-	if result.Error != nil {
-		return fmt.Errorf("updating database version: %w", result.Error)
-	}
-
-	if result.RowsAffected == 0 {
-		err := db.Exec(
-			"INSERT INTO database_versions (id, version, updated_at) VALUES (1, ?, ?)",
-			version, now,
-		).Error
-		if err != nil {
-			return fmt.Errorf("inserting database version: %w", err)
-		}
+	err := db.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "id"}},
+		DoUpdates: clause.AssignmentColumns([]string{"version", "updated_at"}),
+	}).Create(&DatabaseVersion{ID: 1, Version: version, UpdatedAt: now}).Error
+	if err != nil {
+		return fmt.Errorf("upserting database version: %w", err)
 	}
 
 	return nil
 }
 
+// pseudoVersionTimeLayout is Go's pseudo-version timestamp layout
+// (golang.org/ref/mod#pseudo-versions): UTC yyyymmddhhmmss.
+const pseudoVersionTimeLayout = "20060102150405"
+
+// pseudoVersionSuffix matches the trailing "<sep><14 digits>-<12
+// lowercase hex>" of a Go module pseudo-version. The base form
+// (vX.0.0-<date>-<hash>) uses "-" before the timestamp; the
+// pre-release-ancestor and release-ancestor forms
+// (vX.Y.Z-pre.0.<date>-<hash> and vX.Y.(Z+1)-0.<date>-<hash>) use "."
+// because the digit-only "0" marker precedes the timestamp.
+var pseudoVersionSuffix = regexp.MustCompile(`[-.](\d{14})-[0-9a-f]{12}$`)
+
+// pseudoVersionTime returns the embedded commit time when v is a
+// syntactically and semantically valid Go module pseudo-version. The
+// timestamp must parse as a real UTC time; lookalikes with malformed
+// dates (e.g. month 13, day 30 in February) are rejected.
+func pseudoVersionTime(v string) (time.Time, bool) {
+	m := pseudoVersionSuffix.FindStringSubmatch(v)
+	if m == nil {
+		return time.Time{}, false
+	}
+
+	t, err := time.Parse(pseudoVersionTimeLayout, m[1])
+	if err != nil {
+		return time.Time{}, false
+	}
+
+	return t, true
+}
+
 // isDev reports whether a version string represents a development build
-// that should skip version checking.
+// that should skip version checking. Go module pseudo-versions (used by
+// untagged main-sha builds, where runtime/debug.BuildInfo falls back to
+// vX.Y.Z-<timestamp>-<commit>) are treated as dev to avoid poisoning
+// database_versions with synthetic baselines.
 func isDev(version string) bool {
-	return version == "" || version == "dev" || version == "(devel)"
+	if version == "" || version == "dev" || version == "(devel)" {
+		return true
+	}
+
+	_, ok := pseudoVersionTime(version)
+
+	return ok
 }
 
 // checkVersionUpgradePath verifies that the running headscale version

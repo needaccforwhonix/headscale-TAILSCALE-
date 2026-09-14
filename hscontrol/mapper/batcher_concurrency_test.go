@@ -22,7 +22,6 @@ import (
 	"github.com/juanfont/headscale/hscontrol/types/change"
 	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/puzpuzpuz/xsync/v4"
-	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"tailscale.com/tailcfg"
@@ -143,19 +142,16 @@ func runConcurrently(t *testing.T, n int, fn func(i int)) int {
 	)
 
 	for i := range n {
-		wg.Add(1)
-
-		go func(idx int) {
-			defer wg.Done()
+		wg.Go(func() {
 			defer func() {
 				if r := recover(); r != nil {
 					panics.Add(1)
-					t.Logf("panic in goroutine %d: %v", idx, r)
+					t.Logf("panic in goroutine %d: %v", i, r)
 				}
 			}()
 
-			fn(idx)
-		}(i)
+			fn(i)
+		})
 	}
 
 	wg.Wait()
@@ -279,7 +275,7 @@ func TestAddToBatch_FullUpdateOverrides(t *testing.T) {
 	})
 }
 
-// TestAddToBatch_NodeRemovalCleanup verifies that PeersRemoved in a change
+// TestAddToBatch_NodeRemovalCleanup verifies that a permanent node deletion
 // cleans up the node from the batcher's internal state.
 func TestAddToBatch_NodeRemovalCleanup(t *testing.T) {
 	lb := setupLightweightBatcher(t, 5, 10)
@@ -291,11 +287,7 @@ func TestAddToBatch_NodeRemovalCleanup(t *testing.T) {
 	_, exists := lb.b.nodes.Load(removedNode)
 	require.True(t, exists, "node 3 should exist before removal")
 
-	// Send a change that includes node 3 in PeersRemoved
-	lb.b.addToBatch(change.Change{
-		Reason:       "node deleted",
-		PeersRemoved: []types.NodeID{removedNode},
-	})
+	lb.b.addToBatch(change.NodeRemoved(removedNode))
 
 	// Node should be removed from the nodes map
 	_, exists = lb.b.nodes.Load(removedNode)
@@ -473,9 +465,6 @@ func TestProcessBatchedChanges_BundlesChangesPerNode(t *testing.T) {
 // could process bundles from tick N and tick N+1 concurrently for the same
 // node, causing out-of-order delivery and races on lastSentPeers.
 func TestWorkMu_PreventsInterTickRace(t *testing.T) {
-	zerolog.SetGlobalLevel(zerolog.Disabled)
-	defer zerolog.SetGlobalLevel(zerolog.DebugLevel)
-
 	mc := newMultiChannelNodeConn(1, nil)
 	ch := make(chan *tailcfg.MapResponse, 100)
 	entry := &connectionEntry{
@@ -849,9 +838,6 @@ func TestBug3_CleanupOfflineNodes_TOCTOU(t *testing.T) {
 // BUG: batcher_lockfree.go worker() - no nil check after b.nodes.Load()
 // FIX: Add nil guard: `exists && nc != nil` in both sync and async paths.
 func TestBug5_WorkerPanicKillsWorkerPermanently(t *testing.T) {
-	zerolog.SetGlobalLevel(zerolog.Disabled)
-	defer zerolog.SetGlobalLevel(zerolog.DebugLevel)
-
 	lb := setupLightweightBatcher(t, 3, 10)
 	defer lb.cleanup()
 
@@ -927,9 +913,6 @@ func TestBug5_WorkerPanicKillsWorkerPermanently(t *testing.T) {
 // BUG: batcher_lockfree.go:163-166 - Start() has no "already started" check
 // FIX: Add sync.Once or atomic.Bool to prevent multiple Start() calls.
 func TestBug6_StartCalledMultipleTimes_GoroutineLeak(t *testing.T) {
-	zerolog.SetGlobalLevel(zerolog.Disabled)
-	defer zerolog.SetGlobalLevel(zerolog.DebugLevel)
-
 	lb := setupLightweightBatcher(t, 3, 10)
 	lb.b.workers = 2
 
@@ -1042,9 +1025,6 @@ func TestBug7_CleanupOfflineNodes_PendingChangesCleanedStructurally(t *testing.T
 //	(timeouts happen here), then write-lock only to remove failed connections.
 //	The lock is now held only for O(N) pointer copies, not for N*50ms I/O.
 func TestBug8_SerialTimeoutUnderWriteLock(t *testing.T) {
-	zerolog.SetGlobalLevel(zerolog.Disabled)
-	defer zerolog.SetGlobalLevel(zerolog.DebugLevel)
-
 	mc := newMultiChannelNodeConn(1, nil)
 
 	// Add 5 stale connections (unbuffered, no reader = will timeout at 50ms each)
@@ -1148,9 +1128,6 @@ func TestScale1000_AddToBatch_Broadcast(t *testing.T) {
 		t.Skip("skipping 1000-node test in short mode")
 	}
 
-	zerolog.SetGlobalLevel(zerolog.ErrorLevel)
-	defer zerolog.SetGlobalLevel(zerolog.DebugLevel)
-
 	lb := setupLightweightBatcher(t, 1000, 10)
 	defer lb.cleanup()
 
@@ -1180,9 +1157,6 @@ func TestScale1000_ProcessBatchedWithConcurrentAdd(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping 1000-node test in short mode")
 	}
-
-	zerolog.SetGlobalLevel(zerolog.ErrorLevel)
-	defer zerolog.SetGlobalLevel(zerolog.DebugLevel)
 
 	lb := setupLightweightBatcher(t, 1000, 10)
 	defer lb.cleanup()
@@ -1235,9 +1209,6 @@ func TestScale1000_MultiChannelBroadcast(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping 1000-node test in short mode")
 	}
-
-	zerolog.SetGlobalLevel(zerolog.ErrorLevel)
-	defer zerolog.SetGlobalLevel(zerolog.DebugLevel)
 
 	const (
 		nodeCount  = 1000
@@ -1339,9 +1310,6 @@ func TestScale1000_ConnectionChurn(t *testing.T) {
 		t.Skip("skipping 1000-node test in short mode")
 	}
 
-	zerolog.SetGlobalLevel(zerolog.ErrorLevel)
-	defer zerolog.SetGlobalLevel(zerolog.DebugLevel)
-
 	lb := setupLightweightBatcher(t, 1000, 20)
 	defer lb.cleanup()
 
@@ -1441,9 +1409,6 @@ func TestScale1000_ConcurrentAddRemove(t *testing.T) {
 		t.Skip("skipping 1000-node test in short mode")
 	}
 
-	zerolog.SetGlobalLevel(zerolog.ErrorLevel)
-	defer zerolog.SetGlobalLevel(zerolog.DebugLevel)
-
 	lb := setupLightweightBatcher(t, 1000, 10)
 	defer lb.cleanup()
 
@@ -1484,9 +1449,6 @@ func TestScale1000_IsConnectedConsistency(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping 1000-node test in short mode")
 	}
-
-	zerolog.SetGlobalLevel(zerolog.ErrorLevel)
-	defer zerolog.SetGlobalLevel(zerolog.DebugLevel)
 
 	lb := setupLightweightBatcher(t, 1000, 10)
 	defer lb.cleanup()
@@ -1553,9 +1515,6 @@ func TestScale1000_BroadcastDuringNodeChurn(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping 1000-node test in short mode")
 	}
-
-	zerolog.SetGlobalLevel(zerolog.ErrorLevel)
-	defer zerolog.SetGlobalLevel(zerolog.DebugLevel)
 
 	lb := setupLightweightBatcher(t, 1000, 10)
 	defer lb.cleanup()
@@ -1641,9 +1600,6 @@ func TestScale1000_WorkChannelSaturation(t *testing.T) {
 		t.Skip("skipping 1000-node test in short mode")
 	}
 
-	zerolog.SetGlobalLevel(zerolog.ErrorLevel)
-	defer zerolog.SetGlobalLevel(zerolog.DebugLevel)
-
 	// Create batcher with SMALL work channel to force saturation
 	b := &Batcher{
 		tick:    time.NewTicker(10 * time.Millisecond),
@@ -1719,9 +1675,6 @@ func TestScale1000_FullUpdate_AllNodesGetPending(t *testing.T) {
 		t.Skip("skipping 1000-node test in short mode")
 	}
 
-	zerolog.SetGlobalLevel(zerolog.ErrorLevel)
-	defer zerolog.SetGlobalLevel(zerolog.DebugLevel)
-
 	lb := setupLightweightBatcher(t, 1000, 10)
 	defer lb.cleanup()
 
@@ -1756,9 +1709,6 @@ func TestScale1000_AllToAll_FullPipeline(t *testing.T) {
 	if util.RaceEnabled {
 		t.Skip("skipping 1000-node test with race detector (bcrypt setup too slow)")
 	}
-
-	zerolog.SetGlobalLevel(zerolog.ErrorLevel)
-	defer zerolog.SetGlobalLevel(zerolog.DebugLevel)
 
 	t.Logf("setting up 1000-node test environment (this may take a minute)...")
 

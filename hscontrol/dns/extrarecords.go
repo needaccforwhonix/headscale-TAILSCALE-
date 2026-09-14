@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 
 	"github.com/cenkalti/backoff/v5"
@@ -27,43 +28,50 @@ type ExtraRecordsMan struct {
 
 	updateCh chan []tailcfg.DNSRecord
 	closeCh  chan struct{}
-	hashes   map[string][32]byte
+	hash     [32]byte
 }
 
-// NewExtraRecordsManager creates a new ExtraRecordsMan and starts watching the file at the given path.
+// NewExtraRecordsManager creates a new [ExtraRecordsMan] and starts watching the file at the given path.
 func NewExtraRecordsManager(path string) (*ExtraRecordsMan, error) {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		return nil, fmt.Errorf("creating watcher: %w", err)
 	}
 
+	closeWatcher := func() {
+		_ = watcher.Close()
+	}
+
 	fi, err := os.Stat(path)
 	if err != nil {
+		closeWatcher()
 		return nil, fmt.Errorf("getting file info: %w", err)
 	}
 
 	if fi.IsDir() {
+		closeWatcher()
 		return nil, fmt.Errorf("%w: %s", ErrPathIsDirectory, path)
 	}
 
 	records, hash, err := readExtraRecordsFromPath(path)
 	if err != nil {
+		closeWatcher()
 		return nil, fmt.Errorf("reading extra records from path: %w", err)
 	}
 
 	er := &ExtraRecordsMan{
-		watcher: watcher,
-		path:    path,
-		records: set.SetOf(records),
-		hashes: map[string][32]byte{
-			path: hash,
-		},
+		watcher:  watcher,
+		path:     path,
+		records:  set.SetOf(records),
+		hash:     hash,
 		closeCh:  make(chan struct{}),
 		updateCh: make(chan []tailcfg.DNSRecord),
 	}
 
 	err = watcher.Add(path)
 	if err != nil {
+		closeWatcher()
+
 		return nil, fmt.Errorf("adding path to watcher: %w", err)
 	}
 
@@ -103,15 +111,21 @@ func (e *ExtraRecordsMan) Run() {
 				// If a file is removed or renamed, fsnotify will lose track of it
 				// and not watch it. We will therefore attempt to re-add it with a backoff.
 			case fsnotify.Remove, fsnotify.Rename:
-				_, err := backoff.Retry(context.Background(), func() (struct{}, error) {
-					if _, err := os.Stat(e.path); err != nil { //nolint:noinlineerr
-						return struct{}{}, err
+				err := e.waitUntilPathExists()
+				if err != nil {
+					select {
+					case <-e.closeCh:
+						return
+					default:
 					}
 
-					return struct{}{}, nil
-				}, backoff.WithBackOff(backoff.NewExponentialBackOff()))
-				if err != nil {
 					log.Error().Caller().Err(err).Msgf("extra records filewatcher retrying to find file after delete")
+
+					addErr := e.watcher.Add(filepath.Dir(e.path))
+					if addErr != nil {
+						log.Error().Caller().Err(addErr).Msgf("extra records filewatcher watching parent after delete failed")
+					}
+
 					continue
 				}
 
@@ -141,6 +155,29 @@ func (e *ExtraRecordsMan) Close() {
 	close(e.closeCh)
 }
 
+func (e *ExtraRecordsMan) waitUntilPathExists() error {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		select {
+		case <-e.closeCh:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+
+	_, err := backoff.Retry(ctx, func() (struct{}, error) {
+		if _, err := os.Stat(e.path); err != nil { //nolint:noinlineerr
+			return struct{}{}, err
+		}
+
+		return struct{}{}, nil
+	}, backoff.WithBackOff(backoff.NewExponentialBackOff()))
+
+	return err
+}
+
 func (e *ExtraRecordsMan) UpdateCh() <-chan []tailcfg.DNSRecord {
 	return e.updateCh
 }
@@ -158,44 +195,54 @@ func (e *ExtraRecordsMan) updateRecords() {
 	}
 
 	e.mu.Lock()
-	defer e.mu.Unlock()
 
 	// If there has not been any change, ignore the update.
-	if oldHash, ok := e.hashes[e.path]; ok {
-		if newHash == oldHash {
-			return
-		}
+	if newHash == e.hash {
+		e.mu.Unlock()
+
+		return
 	}
 
 	oldCount := e.records.Len()
 
 	e.records = set.SetOf(records)
-	e.hashes[e.path] = newHash
+	e.hash = newHash
+	toSend := e.records.Slice()
 
 	log.Trace().Caller().Interface("records", e.records).Msgf("extra records updated from path, count old: %d, new: %d", oldCount, e.records.Len())
 
-	e.updateCh <- e.records.Slice()
+	// Release the lock before the (potentially blocking) send so a slow or
+	// absent consumer cannot stall Records() readers, and abort the send on
+	// shutdown instead of leaking this goroutine on the closed-down channel.
+	e.mu.Unlock()
+
+	select {
+	case e.updateCh <- toSend:
+	case <-e.closeCh:
+	}
 }
 
-// readExtraRecordsFromPath reads a JSON file of tailcfg.DNSRecord
+// readExtraRecordsFromPath reads a JSON file of [tailcfg.DNSRecord]
 // and returns the records and the hash of the file.
 func readExtraRecordsFromPath(path string) ([]tailcfg.DNSRecord, [32]byte, error) {
+	var zero [32]byte
+
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return nil, [32]byte{}, fmt.Errorf("reading path: %s, err: %w", path, err)
+		return nil, zero, fmt.Errorf("reading path: %s, err: %w", path, err)
 	}
 
 	// If the read was triggered too fast, and the file is not complete, ignore the update
 	// if the file is empty. A consecutive update will be triggered when the file is complete.
 	if len(b) == 0 {
-		return nil, [32]byte{}, nil
+		return nil, zero, nil
 	}
 
 	var records []tailcfg.DNSRecord
 
 	err = json.Unmarshal(b, &records)
 	if err != nil {
-		return nil, [32]byte{}, fmt.Errorf("unmarshalling records, content: %q: %w", string(b), err)
+		return nil, zero, fmt.Errorf("unmarshalling records, content: %q: %w", string(b), err)
 	}
 
 	hash := sha256.Sum256(b)

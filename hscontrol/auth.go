@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/juanfont/headscale/hscontrol/types"
-	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/rs/zerolog/log"
 	"gorm.io/gorm"
 	"tailscale.com/tailcfg"
@@ -22,6 +21,18 @@ type AuthProvider interface {
 	AuthHandler(w http.ResponseWriter, r *http.Request)
 	RegisterURL(authID types.AuthID) string
 	AuthURL(authID types.AuthID) string
+}
+
+// machineKeyMismatch fails closed when a node looked up by NodeKey was started
+// in a Noise session with a different machine key. Without this anyone holding a
+// target's NodeKey could open a session with a throwaway machine key and act on
+// the owner's node. Returns a 401 [HTTPError] on mismatch, nil otherwise.
+func machineKeyMismatch(node types.NodeView, machineKey key.MachinePublic) error {
+	if node.MachineKey() != machineKey {
+		return NewHTTPError(http.StatusUnauthorized, "node exists with a different machine key", nil)
+	}
+
+	return nil
 }
 
 func (h *Headscale) handleRegister(
@@ -74,20 +85,16 @@ func (h *Headscale) handleRegister(
 			// the Noise session's machine key matches the cached node.
 			// Without this check anyone holding a target's NodeKey could
 			// open a Noise session with a throwaway machine key and read
-			// the owner's User/Login back through nodeToRegisterResponse.
-			// handleLogout enforces the same check on its own path.
-			if node.MachineKey() != machineKey {
-				return nil, NewHTTPError(
-					http.StatusUnauthorized,
-					"node exists with a different machine key",
-					nil,
-				)
+			// the owner's User/Login back through [nodeToRegisterResponse].
+			// [Headscale.handleLogout] enforces the same check on its own path.
+			err := machineKeyMismatch(node, machineKey)
+			if err != nil {
+				return nil, err
 			}
 
-			// When tailscaled restarts, it sends RegisterRequest with Auth=nil and Expiry=zero.
+			// When tailscaled restarts, it sends [tailcfg.RegisterRequest] with Auth=nil and Expiry=zero.
 			// Return the current node state without modification.
-			// See: https://github.com/juanfont/headscale/issues/2862
-			if req.Expiry.IsZero() && node.Expiry().Valid() && !node.IsExpired() {
+			if req.Expiry.IsZero() && !node.IsExpired() {
 				return nodeToRegisterResponse(node), nil
 			}
 
@@ -155,8 +162,9 @@ func (h *Headscale) handleLogout(
 	// Fail closed if it looks like this is an attempt to modify a node where
 	// the node key and the machine key the noise session was started with does
 	// not align.
-	if node.MachineKey() != machineKey {
-		return nil, NewHTTPError(http.StatusUnauthorized, "node exist with different machine key", nil)
+	err := machineKeyMismatch(node, machineKey)
+	if err != nil {
+		return nil, err
 	}
 
 	// Note: We do NOT return early if req.Auth is set, because Tailscale clients
@@ -193,7 +201,7 @@ func (h *Headscale) handleLogout(
 	}
 
 	// If the request expiry is in the past, we consider it a logout.
-	// Zero expiry is handled in handleRegister() before calling this function.
+	// Zero expiry is handled in [Headscale.handleRegister] before calling this function.
 	if req.Expiry.Before(time.Now()) {
 		log.Debug().
 			EmbedObject(node).
@@ -208,11 +216,13 @@ func (h *Headscale) handleLogout(
 				Msg("Deleting ephemeral node during logout")
 
 			c, err := h.state.DeleteNode(node)
+			if !c.IsEmpty() {
+				h.Change(c)
+			}
+
 			if err != nil {
 				return nil, fmt.Errorf("deleting ephemeral node: %w", err)
 			}
-
-			h.Change(c)
 
 			return &tailcfg.RegisterResponse{
 				NodeKeyExpired:    true,
@@ -225,9 +235,32 @@ func (h *Headscale) handleLogout(
 			Msg("Node is not ephemeral, setting expiry instead of deleting")
 	}
 
+	// Tagged nodes have key expiry permanently disabled (they are owned by
+	// their tags, not a user, and never expire - KB 1068). Logging one out has
+	// no expiry semantics, so do not stamp an expiry on it: doing so leaves the
+	// node IsExpired() forever and it can never re-authenticate (#3371). The
+	// admin path `headscale nodes expire` remains free to set a deliberate
+	// expiry via SetNodeExpiry; only the logout path is guarded here.
+	if node.IsTagged() {
+		log.Debug().
+			EmbedObject(node).
+			Msg("Tagged node logout: not stamping expiry (tagged nodes never expire)")
+
+		return nodeToRegisterResponse(node), nil
+	}
+
 	// Update the internal state with the nodes new expiry, meaning it is
 	// logged out.
+	//
+	// Clamp the client-supplied value to now: Tailscale sends the
+	// sentinel time.Unix(123, 0) on logout (controlclient/direct.go),
+	// and storing it verbatim propagates a 1970 KeyExpiry to every
+	// peer's netmap. Semantically identical (expired as of now), but
+	// sane in logs, debug dumps, and peer netmaps.
 	expiry := req.Expiry
+	if now := time.Now(); expiry.Before(now) {
+		expiry = now
+	}
 
 	updatedNode, c, err := h.state.SetNodeExpiry(node.ID(), &expiry)
 	if err != nil {
@@ -255,7 +288,7 @@ func nodeToRegisterResponse(node types.NodeView) *tailcfg.RegisterResponse {
 		MachineAuthorized: true,
 	}
 
-	// For tagged nodes, use the TaggedDevices special user
+	// For tagged nodes, use the [types.TaggedDevices] special user
 	// For user-owned nodes, include User and Login information from the actual user
 	if node.IsTagged() {
 		resp.User = types.TaggedDevices.View().TailscaleUser()
@@ -284,18 +317,40 @@ func (h *Headscale) waitForFollowup(
 	}
 
 	if reg, ok := h.state.GetAuthCacheEntry(followupReg); ok {
+		var verdict types.AuthVerdict
 		select {
-		case <-ctx.Done():
-			return nil, NewHTTPError(http.StatusUnauthorized, "registration timed out", err)
-		case verdict := <-reg.WaitForAuth():
-			if verdict.Accept() {
-				if !verdict.Node.Valid() {
-					// registration is expired in the cache, instruct the client to try a new registration
-					return h.reqToNewRegisterResponse(req, machineKey)
-				}
-
-				return nodeToRegisterResponse(verdict.Node), nil
+		// Prefer a completed registration even if the context has also
+		// expired. When both are ready, a plain select picks at random and
+		// would discard a successful registration as a spurious timeout
+		// (issue #3385).
+		case verdict = <-reg.WaitForAuth():
+		default:
+			select {
+			case <-ctx.Done():
+				return nil, NewHTTPError(http.StatusUnauthorized, "registration timed out", ctx.Err())
+			case verdict = <-reg.WaitForAuth():
 			}
+		}
+
+		if verdict.Accept() {
+			if !verdict.Node.Valid() {
+				// registration is expired in the cache, instruct the client to try a new registration
+				return h.reqToNewRegisterResponse(req, machineKey)
+			}
+
+			// The followup poll is only authenticated by the auth ID in the
+			// URL, so fail closed unless the Noise session asking for the
+			// result was started with the same machine key that opened the
+			// registration. [State.HandleNodeFromAuthPath] resolves the node
+			// from the cached [types.RegistrationData.MachineKey], so the two
+			// match on the normal path. [Headscale.handleRegister] and
+			// [Headscale.handleLogout] apply the same check.
+			err := machineKeyMismatch(verdict.Node, machineKey)
+			if err != nil {
+				return nil, err
+			}
+
+			return nodeToRegisterResponse(verdict.Node), nil
 		}
 	}
 
@@ -304,8 +359,8 @@ func (h *Headscale) waitForFollowup(
 }
 
 // reqToNewRegisterResponse refreshes the registration flow by creating a new
-// registration ID and returning the corresponding AuthURL so the client can
-// restart the authentication process.
+// registration ID and returning the corresponding [tailcfg.RegisterResponse.AuthURL]
+// so the client can restart the authentication process.
 func (h *Headscale) reqToNewRegisterResponse(
 	req tailcfg.RegisterRequest,
 	machineKey key.MachinePublic,
@@ -327,8 +382,8 @@ func (h *Headscale) reqToNewRegisterResponse(
 	}, nil
 }
 
-// registrationDataFromRequest builds the RegistrationData payload stored
-// in the auth cache for a pending registration. The original Hostinfo is
+// registrationDataFromRequest builds the [types.RegistrationData] payload stored
+// in the auth cache for a pending registration. The original [tailcfg.Hostinfo] is
 // retained so that consumers (auth callback, observability) see the
 // fields the client originally announced; the bounded-LRU cap on the
 // cache is what bounds the unauthenticated cache-fill DoS surface.
@@ -336,11 +391,10 @@ func registrationDataFromRequest(
 	req tailcfg.RegisterRequest,
 	machineKey key.MachinePublic,
 ) *types.RegistrationData {
-	hostname := util.EnsureHostname(
-		req.Hostinfo.View(),
-		machineKey.String(),
-		req.NodeKey.String(),
-	)
+	var hostname string
+	if req.Hostinfo != nil {
+		hostname = req.Hostinfo.Hostname
+	}
 
 	regData := &types.RegistrationData{
 		MachineKey: machineKey,

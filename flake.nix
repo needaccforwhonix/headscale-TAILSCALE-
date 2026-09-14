@@ -4,12 +4,17 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
     flake-utils.url = "github:numtide/flake-utils";
+    # Reusable Go flake checks (build/test/lint/format); CI runs them via
+    # `nix build .#checks.<system>.<name>` instead of bespoke per-tool steps.
+    flake-checks.url = "github:kradalby/flake-checks";
+    flake-checks.inputs.nixpkgs.follows = "nixpkgs";
   };
 
   outputs =
     { self
     , nixpkgs
     , flake-utils
+    , flake-checks
     , ...
     }:
     let
@@ -26,8 +31,10 @@
       overlays.default = _: prev:
         let
           pkgs = nixpkgs.legacyPackages.${prev.stdenv.hostPlatform.system};
-          buildGo = pkgs.buildGo126Module;
-          vendorHash = "sha256-1jVYsI73Sa9/xigxldfvH0TkQThJIGGIq+1A7ARZ068=";
+          # Tracks the newest Go in nixpkgs (currently 1.27) so a Go release
+          # bump is a flake.lock update, not a flake.nix edit.
+          buildGo = pkgs.buildGoLatestModule;
+          vendorHash = (builtins.fromJSON (builtins.readFile ./flakehashes.json)).vendor.sri;
         in
         {
           headscale = buildGo {
@@ -38,8 +45,8 @@
             # Only run unit tests when testing a build
             checkFlags = [ "-short" ];
 
-            # When updating go.mod or go.sum, a new sha will need to be calculated,
-            # update this if you have a mismatch after doing a change to those files.
+            # vendorHash is read from flakehashes.json; refresh via:
+            #   go run ./cmd/vendorhash update
             inherit vendorHash;
 
             subPackages = [ "cmd/headscale" ];
@@ -60,81 +67,6 @@
             subPackages = [ "cmd/hi" ];
           };
 
-          protoc-gen-grpc-gateway = buildGo rec {
-            pname = "grpc-gateway";
-            version = "2.28.0";
-
-            src = pkgs.fetchFromGitHub {
-              owner = "grpc-ecosystem";
-              repo = "grpc-gateway";
-              rev = "v${version}";
-              sha256 = "sha256-93omvHb+b+S0w4D+FGEEwYYDjgumJFDAruc1P4elfvA=";
-            };
-
-            vendorHash = "sha256-jVP5zfFPfHeAEApKNJzZwuZLA+DjKgkL7m2DFG72UNs=";
-
-            nativeBuildInputs = [ pkgs.installShellFiles ];
-
-            subPackages = [ "protoc-gen-grpc-gateway" "protoc-gen-openapiv2" ];
-          };
-
-          protobuf-language-server = buildGo rec {
-            pname = "protobuf-language-server";
-            version = "ab4c128";
-
-            src = pkgs.fetchFromGitHub {
-              owner = "lasorda";
-              repo = "protobuf-language-server";
-              rev = "ab4c128f00774d51bd6d1f4cfa735f4b7c8619e3";
-              sha256 = "sha256-yF6kG+qTRxVO/qp2V9HgTyFBeOm5RQzeqdZFrdidwxM=";
-            };
-
-            vendorHash = "sha256-4nTpKBe7ekJsfQf+P6edT/9Vp2SBYbKz1ITawD3bhkI=";
-
-            subPackages = [ "." ];
-          };
-
-          # Build golangci-lint with Go 1.26 (upstream uses hardcoded Go version)
-          golangci-lint = buildGo rec {
-            pname = "golangci-lint";
-            version = "2.11.4";
-
-            src = pkgs.fetchFromGitHub {
-              owner = "golangci";
-              repo = "golangci-lint";
-              rev = "v${version}";
-              hash = "sha256-B19aLvfNRY9TOYw/71f2vpNUuSIz8OI4dL0ijGezsas=";
-            };
-
-            vendorHash = "sha256-xuoj4+U4tB5gpABKq4Dbp2cxnljxdYoBbO8A7DqPM5E=";
-
-            subPackages = [ "cmd/golangci-lint" ];
-
-            nativeBuildInputs = [ pkgs.installShellFiles ];
-
-            ldflags = [
-              "-s"
-              "-w"
-              "-X main.version=${version}"
-              "-X main.commit=v${version}"
-              "-X main.date=1970-01-01T00:00:00Z"
-            ];
-
-            postInstall = ''
-              for shell in bash zsh fish; do
-                HOME=$TMPDIR $out/bin/golangci-lint completion $shell > golangci-lint.$shell
-                installShellCompletion golangci-lint.$shell
-              done
-            '';
-
-            meta = {
-              description = "Fast linters runner for Go";
-              homepage = "https://golangci-lint.run/";
-              changelog = "https://github.com/golangci/golangci-lint/blob/v${version}/CHANGELOG.md";
-              mainProgram = "golangci-lint";
-            };
-          };
-
           gotestsum = prev.gotestsum.override {
             buildGoModule = buildGo;
           };
@@ -147,8 +79,20 @@
             buildGoModule = buildGo;
           };
 
-          gopls = prev.gopls.override {
-            buildGoLatestModule = buildGo;
+          golines = prev.golines.override {
+            buildGoModule = buildGo;
+          };
+
+          # goimports and friends: they parse Go with the parser of the Go
+          # they were built with, so an older one rejects new syntax.
+          gotools = prev.gotools.override {
+            buildGoModule = buildGo;
+            # goimports is wrapped with this go on PATH for module lookups.
+            go = pkgs.go_latest;
+          };
+
+          golangci-lint-langserver = prev.golangci-lint-langserver.override {
+            buildGoModule = buildGo;
           };
         };
     }
@@ -159,7 +103,7 @@
           overlays = [ self.overlays.default ];
           inherit system;
         };
-        buildDeps = with pkgs; [ git go_1_26 gnumake ];
+        buildDeps = with pkgs; [ git go_latest gnumake ];
         devDeps = with pkgs;
           buildDeps
           ++ [
@@ -174,31 +118,29 @@
             gotests
             gofumpt
             gopls
+            gotools
+
             ksh
             ko
             yq-go
             ripgrep
             postgresql
-            python314Packages.mdformat
-            python314Packages.mdformat-footnote
-            python314Packages.mdformat-frontmatter
-            python314Packages.mdformat-mkdocs
+
+            # External clients exercised by the Tailscale-compatible v2 API
+            # roundtrip tests (TestAPIv2). Binaries: tofu, tscli.
+            opentofu
+            tscli
+            python3Packages.mdformat
+            python3Packages.mdformat-footnote
+            python3Packages.mdformat-frontmatter
+            python3Packages.mdformat-mkdocs
             prek
 
             # 'dot' is needed for pprof graphs
             # go tool pprof -http=: <source>
             graphviz
-
-            # Protobuf dependencies
-            protobuf
-            protoc-gen-go
-            protoc-gen-go-grpc
-            protoc-gen-grpc-gateway
-            buf
-            clang-tools # clang-format
-            protobuf-language-server
           ]
-          ++ lib.optional pkgs.stdenv.isLinux [ traceroute ];
+          ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [ traceroute ];
 
         # Add entry to build a docker image with headscale
         # caveat: only works on Linux
@@ -212,6 +154,59 @@
           contents = [ pkgs.headscale ];
           config.Entrypoint = [ (pkgs.headscale + "/bin/headscale") ];
         };
+
+        # Go flake checks from the flake-checks library. CI gates on
+        # `nix build .#checks.<system>.<name>`; the logic lives here, not in
+        # bespoke workflow steps. Linux-only: parts of the tree are
+        # Linux-specific and the pure unit subset is validated by CI.
+        fc = flake-checks.lib;
+        common = {
+          inherit pkgs;
+          root = ./.;
+          pname = "headscale";
+          version = headscaleVersion;
+          vendorHash = (builtins.fromJSON (builtins.readFile ./flakehashes.json)).vendor.sri;
+          goPkg = pkgs.go_latest;
+          # //go:embed targets and test-read files outside the default whitelist.
+          embedDirs = [ ./hscontrol/assets ./hscontrol/db/schema.sql ./config-example.yaml ];
+          extraSrc = [
+            ./hscontrol/testdata
+            ./hscontrol/types/testdata
+            ./hscontrol/db/testdata
+            ./hscontrol/policy/v2/testdata
+          ];
+        };
+        goChecks = {
+          build = fc.goBuild (common // { subPackages = [ "cmd/headscale" ]; });
+
+          # The pure unit subset. ./integration (Docker) and
+          # ./hscontrol/servertest (slow: 10s+ convergence plus race/stress/HA
+          # property tests — run by the servertest workflow instead) are dropped
+          # from the test set but kept in source so cmd/hi and friends still
+          # compile; TestPostgres* needs a server (the SQLite equivalents still
+          # run). CGO off matches the build.
+          gotest = fc.goTest (common // {
+            testExclude = [ "/integration" "/hscontrol/servertest" ];
+            goSkip = [ "TestPostgres" ];
+            testEnv = "export CGO_ENABLED=0";
+          });
+
+          # Full-tree golangci-lint (golines, gofumpt, etc.); uses the overlay's
+          # golangci-lint built against the pinned Go.
+          golangci-lint = fc.goLint common;
+
+          # nixpkgs-fmt + prettier, excluding generated output. goFmt = "off":
+          # Go formatting (golines, gofumpt) is enforced by the golangci-lint
+          # check, not treefmt. prettierExts matches the old prettier-lint glob
+          # (no json: testdata fixtures are hand-formatted).
+          formatting = fc.goFormat (common // {
+            goFmt = "off";
+            prettier = true;
+            prettierExts = [ "ts" "js" "md" "yaml" "yml" "sass" "css" "scss" "html" ];
+            # Mirror .prettierignore (docs/ are mkdocs-flavoured; gen/ generated).
+            fmtExclude = [ ./gen ./docs ];
+          });
+        };
       in
       {
         # `nix develop`
@@ -223,19 +218,13 @@
                 "nix-vendor-sri"
                 ''
                   set -eu
-
-                  OUT=$(mktemp -d -t nar-hash-XXXXXX)
-                  rm -rf "$OUT"
-
-                  go mod vendor -o "$OUT"
-                  go run tailscale.com/cmd/nardump --sri "$OUT"
-                  rm -rf "$OUT"
+                  exec go run ./cmd/vendorhash update "$@"
                 '')
 
               (pkgs.writeShellScriptBin
                 "go-mod-update-all"
                 ''
-                  cat go.mod | ${pkgs.silver-searcher}/bin/ag "\t" | ${pkgs.silver-searcher}/bin/ag -v indirect | ${pkgs.gawk}/bin/awk '{print $1}' | ${pkgs.findutils}/bin/xargs go get -u
+                  cat go.mod | ${pkgs.ripgrep}/bin/rg "\t" | ${pkgs.ripgrep}/bin/rg -v '^\s*//' | ${pkgs.ripgrep}/bin/rg -v indirect | ${pkgs.gawk}/bin/awk '{print $1}' | ${pkgs.findutils}/bin/xargs go get -u
                   go mod tidy
                 '')
             ];
@@ -263,6 +252,9 @@
 
         checks = {
           headscale = pkgs.testers.nixosTest (import ./nix/tests/headscale.nix);
-        };
+        }
+        # The Go build/test checks are gated to Linux: parts of the tree are
+        # Linux-specific and the pure unit subset is validated by CI.
+        // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux goChecks;
       });
 }

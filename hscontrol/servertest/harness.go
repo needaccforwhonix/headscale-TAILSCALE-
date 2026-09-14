@@ -8,7 +8,7 @@ import (
 	"github.com/juanfont/headscale/hscontrol/types"
 )
 
-// TestHarness orchestrates a TestServer with multiple TestClients,
+// TestHarness orchestrates a [TestServer] with multiple [TestClient] instances,
 // providing a convenient setup for multi-node control plane tests.
 type TestHarness struct {
 	Server  *TestServer
@@ -18,7 +18,7 @@ type TestHarness struct {
 	defaultUser *types.User
 }
 
-// HarnessOption configures a TestHarness.
+// HarnessOption configures a [TestHarness].
 type HarnessOption func(*harnessConfig)
 
 type harnessConfig struct {
@@ -33,24 +33,24 @@ func defaultHarnessConfig() *harnessConfig {
 	}
 }
 
-// WithServerOptions passes ServerOptions through to the underlying
-// TestServer.
+// WithServerOptions passes [ServerOption] values through to the underlying
+// [TestServer].
 func WithServerOptions(opts ...ServerOption) HarnessOption {
 	return func(c *harnessConfig) { c.serverOpts = append(c.serverOpts, opts...) }
 }
 
-// WithDefaultClientOptions applies ClientOptions to every client
-// created by NewHarness.
+// WithDefaultClientOptions applies [ClientOption] values to every client
+// created by [NewHarness].
 func WithDefaultClientOptions(opts ...ClientOption) HarnessOption {
 	return func(c *harnessConfig) { c.clientOpts = append(c.clientOpts, opts...) }
 }
 
-// WithConvergenceTimeout sets how long WaitForMeshComplete waits.
+// WithConvergenceTimeout sets how long [TestHarness.WaitForMeshComplete] waits.
 func WithConvergenceTimeout(d time.Duration) HarnessOption {
 	return func(c *harnessConfig) { c.convergenceMax = d }
 }
 
-// NewHarness creates a TestServer and numClients connected clients.
+// NewHarness creates a [TestServer] and numClients connected clients.
 // All clients share a default user and are registered with reusable
 // pre-auth keys. The harness waits for all clients to form a
 // complete mesh before returning.
@@ -76,8 +76,7 @@ func NewHarness(tb testing.TB, numClients int, opts ...HarnessOption) *TestHarne
 	for i := range numClients {
 		name := clientName(i)
 
-		copts := append([]ClientOption{WithUser(user)}, hc.clientOpts...)
-		c := NewClient(tb, server, name, copts...)
+		c := h.newClient(tb, name, hc.clientOpts...)
 		h.clients = append(h.clients, c)
 	}
 
@@ -124,11 +123,20 @@ func (h *TestHarness) AddClient(tb testing.TB, opts ...ClientOption) *TestClient
 	tb.Helper()
 
 	name := clientName(len(h.clients))
-	copts := append([]ClientOption{WithUser(h.defaultUser)}, opts...)
-	c := NewClient(tb, h.Server, name, copts...)
+	c := h.newClient(tb, name, opts...)
 	h.clients = append(h.clients, c)
 
 	return c
+}
+
+// newClient creates a [TestClient] on the harness server, prepending the
+// shared default user so caller options can override it.
+func (h *TestHarness) newClient(tb testing.TB, name string, opts ...ClientOption) *TestClient {
+	tb.Helper()
+
+	copts := append([]ClientOption{WithUser(h.defaultUser)}, opts...)
+
+	return NewClient(tb, h.Server, name, copts...)
 }
 
 // WaitForMeshComplete blocks until every connected client sees
@@ -143,13 +151,6 @@ func (h *TestHarness) WaitForMeshComplete(tb testing.TB, timeout time.Duration) 
 	for _, c := range connected {
 		c.WaitForPeers(tb, expectedPeers, timeout)
 	}
-}
-
-// WaitForConvergence waits until all connected clients have a
-// non-nil NetworkMap and their peer counts have stabilised.
-func (h *TestHarness) WaitForConvergence(tb testing.TB, timeout time.Duration) {
-	tb.Helper()
-	h.WaitForMeshComplete(tb, timeout)
 }
 
 // ChangePolicy sets an ACL policy on the server and propagates changes

@@ -1,12 +1,14 @@
 package hscontrol
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
 	"net/netip"
+	"slices"
 	"strings"
 	"time"
 
@@ -19,9 +21,9 @@ import (
 	"tailscale.com/tsweb"
 )
 
-// protectedDebugHandler wraps an http.Handler with an access check that
+// protectedDebugHandler wraps an [http.Handler] with an access check that
 // allows requests from loopback, Tailscale CGNAT IPs, and private
-// (RFC 1918 / RFC 4193) addresses. This extends tsweb.Protected which
+// (RFC 1918 / RFC 4193) addresses. This extends [tsweb.Protected] which
 // only allows loopback and Tailscale IPs.
 func protectedDebugHandler(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -31,7 +33,7 @@ func protectedDebugHandler(h http.Handler) http.Handler {
 			return
 		}
 
-		// tsweb.AllowDebugAccess rejects X-Forwarded-For and non-TS IPs.
+		// [tsweb.AllowDebugAccess] rejects X-Forwarded-For and non-TS IPs.
 		// Additionally allow private/LAN addresses so operators can reach
 		// debug endpoints from their local network without tailscaled.
 		ipStr, _, err := net.SplitHostPort(r.RemoteAddr)
@@ -48,51 +50,45 @@ func protectedDebugHandler(h http.Handler) http.Handler {
 	})
 }
 
+// writeJSON marshals v with indentation and writes it as a 200 JSON response.
+func writeJSON(w http.ResponseWriter, v any) {
+	b, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		httpError(w, err)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(b)
+}
+
+// writeDebug renders a debug endpoint as JSON or text/plain depending on the
+// request's Accept header. JSON is produced only when explicitly requested;
+// text/plain is the default for backward compatibility.
+func writeDebug(w http.ResponseWriter, r *http.Request, jsonVal func() any, textVal func() string) {
+	if strings.Contains(r.Header.Get("Accept"), "application/json") {
+		writeJSON(w, jsonVal())
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/plain")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(textVal()))
+}
+
 func (h *Headscale) debugHTTPServer() *http.Server {
 	debugMux := http.NewServeMux()
 	debug := tsweb.Debugger(debugMux)
 
 	// State overview endpoint
 	debug.Handle("overview", "State overview", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Check Accept header to determine response format
-		acceptHeader := r.Header.Get("Accept")
-		wantsJSON := strings.Contains(acceptHeader, "application/json")
-
-		if wantsJSON {
-			overview := h.state.DebugOverviewJSON()
-
-			overviewJSON, err := json.MarshalIndent(overview, "", "  ")
-			if err != nil {
-				httpError(w, err)
-				return
-			}
-
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write(overviewJSON)
-		} else {
-			// Default to text/plain for backward compatibility
-			overview := h.state.DebugOverview()
-
-			w.Header().Set("Content-Type", "text/plain")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(overview))
-		}
+		writeDebug(w, r, func() any { return h.state.DebugOverviewJSON() }, h.state.DebugOverview)
 	}))
 
 	// Configuration endpoint
 	debug.Handle("config", "Current configuration", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		config := h.state.DebugConfig()
-
-		configJSON, err := json.MarshalIndent(config, "", "  ")
-		if err != nil {
-			httpError(w, err)
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(configJSON)
+		writeJSON(w, h.state.DebugConfig())
 	}))
 
 	// Policy endpoint
@@ -123,157 +119,37 @@ func (h *Headscale) debugHTTPServer() *http.Server {
 			return
 		}
 
-		filterJSON, err := json.MarshalIndent(filter, "", "  ")
-		if err != nil {
-			httpError(w, err)
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(filterJSON)
+		writeJSON(w, filter)
 	}))
 
 	// SSH policies endpoint
 	debug.Handle("ssh", "SSH policies per node", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		sshPolicies := h.state.DebugSSHPolicies()
-
-		sshJSON, err := json.MarshalIndent(sshPolicies, "", "  ")
-		if err != nil {
-			httpError(w, err)
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(sshJSON)
+		writeJSON(w, h.state.DebugSSHPolicies())
 	}))
 
 	// DERP map endpoint
 	debug.Handle("derp", "DERP map configuration", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Check Accept header to determine response format
-		acceptHeader := r.Header.Get("Accept")
-		wantsJSON := strings.Contains(acceptHeader, "application/json")
-
-		if wantsJSON {
-			derpInfo := h.state.DebugDERPJSON()
-
-			derpJSON, err := json.MarshalIndent(derpInfo, "", "  ")
-			if err != nil {
-				httpError(w, err)
-				return
-			}
-
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write(derpJSON)
-		} else {
-			// Default to text/plain for backward compatibility
-			derpInfo := h.state.DebugDERPMap()
-
-			w.Header().Set("Content-Type", "text/plain")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(derpInfo))
-		}
+		writeDebug(w, r, func() any { return h.state.DebugDERPJSON() }, h.state.DebugDERPMap)
 	}))
 
-	// NodeStore endpoint
+	// [state.NodeStore] endpoint
 	debug.Handle("nodestore", "NodeStore information", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Check Accept header to determine response format
-		acceptHeader := r.Header.Get("Accept")
-		wantsJSON := strings.Contains(acceptHeader, "application/json")
-
-		if wantsJSON {
-			nodeStoreNodes := h.state.DebugNodeStoreJSON()
-
-			nodeStoreJSON, err := json.MarshalIndent(nodeStoreNodes, "", "  ")
-			if err != nil {
-				httpError(w, err)
-				return
-			}
-
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write(nodeStoreJSON)
-		} else {
-			// Default to text/plain for backward compatibility
-			nodeStoreInfo := h.state.DebugNodeStore()
-
-			w.Header().Set("Content-Type", "text/plain")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(nodeStoreInfo))
-		}
+		writeDebug(w, r, func() any { return h.state.DebugNodeStoreJSON() }, h.state.DebugNodeStore)
 	}))
 
 	// Registration cache endpoint
 	debug.Handle("registration-cache", "Registration cache information", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		cacheInfo := h.state.DebugRegistrationCache()
-
-		cacheJSON, err := json.MarshalIndent(cacheInfo, "", "  ")
-		if err != nil {
-			httpError(w, err)
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(cacheJSON)
+		writeJSON(w, h.state.DebugRegistrationCache())
 	}))
 
 	// Routes endpoint
 	debug.Handle("routes", "Primary routes", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Check Accept header to determine response format
-		acceptHeader := r.Header.Get("Accept")
-		wantsJSON := strings.Contains(acceptHeader, "application/json")
-
-		if wantsJSON {
-			routes := h.state.DebugRoutes()
-
-			routesJSON, err := json.MarshalIndent(routes, "", "  ")
-			if err != nil {
-				httpError(w, err)
-				return
-			}
-
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write(routesJSON)
-		} else {
-			// Default to text/plain for backward compatibility
-			routes := h.state.DebugRoutesString()
-
-			w.Header().Set("Content-Type", "text/plain")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(routes))
-		}
+		writeDebug(w, r, func() any { return h.state.DebugRoutes() }, h.state.DebugRoutesString)
 	}))
 
 	// Policy manager endpoint
 	debug.Handle("policy-manager", "Policy manager state", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Check Accept header to determine response format
-		acceptHeader := r.Header.Get("Accept")
-		wantsJSON := strings.Contains(acceptHeader, "application/json")
-
-		if wantsJSON {
-			policyManagerInfo := h.state.DebugPolicyManagerJSON()
-
-			policyManagerJSON, err := json.MarshalIndent(policyManagerInfo, "", "  ")
-			if err != nil {
-				httpError(w, err)
-				return
-			}
-
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write(policyManagerJSON)
-		} else {
-			// Default to text/plain for backward compatibility
-			policyManagerInfo := h.state.DebugPolicyManager()
-
-			w.Header().Set("Content-Type", "text/plain")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(policyManagerInfo))
-		}
+		writeDebug(w, r, func() any { return h.state.DebugPolicyManagerJSON() }, h.state.DebugPolicyManager)
 	}))
 
 	debug.Handle("mapresponses", "Map responses for all nodes", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -290,46 +166,15 @@ func (h *Headscale) debugHTTPServer() *http.Server {
 			return
 		}
 
-		resJSON, err := json.MarshalIndent(res, "", "  ")
-		if err != nil {
-			httpError(w, err)
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(resJSON)
+		writeJSON(w, res)
 	}))
 
-	// Batcher endpoint
+	// [mapper.Batcher] endpoint
 	debug.Handle("batcher", "Batcher connected nodes", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Check Accept header to determine response format
-		acceptHeader := r.Header.Get("Accept")
-		wantsJSON := strings.Contains(acceptHeader, "application/json")
-
-		if wantsJSON {
-			batcherInfo := h.debugBatcherJSON()
-
-			batcherJSON, err := json.MarshalIndent(batcherInfo, "", "  ")
-			if err != nil {
-				httpError(w, err)
-				return
-			}
-
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write(batcherJSON)
-		} else {
-			// Default to text/plain for backward compatibility
-			batcherInfo := h.debugBatcher()
-
-			w.Header().Set("Content-Type", "text/plain")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(batcherInfo))
-		}
+		writeDebug(w, r, func() any { return h.debugBatcherJSON() }, h.debugBatcher)
 	}))
 
-	// Ping endpoint: sends a PingRequest to a node and waits for it to respond.
+	// Ping endpoint: sends a [tailcfg.PingRequest] to a node and waits for it to respond.
 	// Supports POST (form submit) and GET with ?node= (clickable quick-ping links).
 	debug.Handle("ping", "Ping a node to check connectivity", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var (
@@ -361,13 +206,12 @@ func (h *Headscale) debugHTTPServer() *http.Server {
 
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
-		//nolint:gosec // elem-go auto-escapes all attribute values; no XSS risk.
-		_, _ = w.Write([]byte(templates.PingPage(query, result, nodes).Render()))
+		_, _ = w.Write([]byte(templates.PingPage(query, result, nodes).Render())) //nolint:gosec // G705: templ component auto-escapes
 	}))
 
-	// statsviz.Register would mount handlers directly on the raw mux,
+	// [statsviz.Register] would mount handlers directly on the raw mux,
 	// bypassing the access gate. Build the server by hand and wrap
-	// each handler with protectedDebugHandler.
+	// each handler with [protectedDebugHandler].
 	statsvizSrv, err := statsviz.NewServer()
 	if err == nil {
 		debugMux.Handle("/debug/statsviz/", protectedDebugHandler(statsvizSrv.Index()))
@@ -380,7 +224,7 @@ func (h *Headscale) debugHTTPServer() *http.Server {
 
 	debugHTTPServer := &http.Server{
 		Addr:         h.cfg.MetricsAddr,
-		Handler:      debugMux,
+		Handler:      securityHeaders(debugMux),
 		ReadTimeout:  types.HTTPTimeout,
 		WriteTimeout: 0,
 	}
@@ -403,9 +247,9 @@ func (h *Headscale) debugBatcher() string {
 		activeConnections int
 	}
 
-	var nodes []nodeStatus
-
 	debugInfo := h.mapBatcher.Debug()
+	nodes := make([]nodeStatus, 0, len(debugInfo))
+
 	for nodeID, info := range debugInfo {
 		nodes = append(nodes, nodeStatus{
 			id:                nodeID,
@@ -420,13 +264,9 @@ func (h *Headscale) debugBatcher() string {
 	}
 
 	// Sort by node ID
-	for i := 0; i < len(nodes); i++ {
-		for j := i + 1; j < len(nodes); j++ {
-			if nodes[i].id > nodes[j].id {
-				nodes[i], nodes[j] = nodes[j], nodes[i]
-			}
-		}
-	}
+	slices.SortFunc(nodes, func(a, b nodeStatus) int {
+		return cmp.Compare(a.id, b.id)
+	})
 
 	// Output sorted nodes
 	for _, node := range nodes {
@@ -511,7 +351,7 @@ func (h *Headscale) connectedNodesList() []templates.ConnectedNode {
 
 const pingTimeout = 30 * time.Second
 
-// doPing sends a PingRequest to the node identified by query and waits for a response.
+// doPing sends a [tailcfg.PingRequest] to the node identified by query and waits for a response.
 func (h *Headscale) doPing(ctx context.Context, query string) *templates.PingResult {
 	if query == "" {
 		return &templates.PingResult{
@@ -541,6 +381,9 @@ func (h *Headscale) doPing(ctx context.Context, query string) *templates.PingRes
 	pingID, responseCh := h.state.RegisterPing(nodeID)
 	defer h.state.CancelPing(pingID)
 
+	// The callback hits /machine/ping-response on the main TLS router,
+	// not the noise chain, so URLIsNoise stays false. Operators running
+	// server_url over plain HTTP are on their own — don't do that.
 	callbackURL := h.cfg.ServerURL + "/machine/ping-response?id=" + pingID
 	h.Change(change.PingNode(nodeID, &tailcfg.PingRequest{
 		URL: callbackURL,

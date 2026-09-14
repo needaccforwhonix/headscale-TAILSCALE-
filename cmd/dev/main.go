@@ -28,12 +28,14 @@ var errHealthTimeout = errors.New("health check timed out")
 
 var errEmptyAuthKey = errors.New("empty auth key in response")
 
+// maxDevPort is the highest --port value that keeps the derived metrics
+// port (port+1010) inside the valid 1..65535 TCP range.
+const maxDevPort = 64525
+
 const devConfig = `---
 server_url: http://127.0.0.1:%d
 listen_addr: 127.0.0.1:%d
 metrics_listen_addr: 127.0.0.1:%d
-grpc_listen_addr: 127.0.0.1:%d
-grpc_allow_insecure: true
 
 noise:
   private_key_path: %s/noise_private.key
@@ -76,6 +78,13 @@ func main() {
 	flag.Parse()
 	log.SetFlags(0)
 
+	if *port < 1 || *port > maxDevPort {
+		log.Fatalf(
+			"--port must be in 1..%d (higher values overflow the derived metrics port); got %d",
+			maxDevPort, *port,
+		)
+	}
+
 	http.DefaultClient.Timeout = 2 * time.Second
 	http.DefaultClient.CheckRedirect = func(*http.Request, []*http.Request) error {
 		return http.ErrUseLastResponse
@@ -89,7 +98,6 @@ func main() {
 
 func run() error {
 	metricsPort := *port + 1010 // default 9090
-	grpcPort := *port + 42363   // default 50443
 
 	tmpDir, err := os.MkdirTemp("", "headscale-dev-")
 	if err != nil {
@@ -102,8 +110,9 @@ func run() error {
 
 	// Write config.
 	configPath := filepath.Join(tmpDir, "config.yaml")
-	configContent := fmt.Sprintf(devConfig,
-		*port, *port, metricsPort, grpcPort,
+	configContent := fmt.Sprintf(
+		devConfig,
+		*port, *port, metricsPort,
 		tmpDir, tmpDir, tmpDir,
 	)
 
@@ -181,7 +190,8 @@ func run() error {
 	}
 
 	// Print banner.
-	fmt.Printf(`
+	fmt.Printf(
+		`
 === Headscale Dev Environment ===
   Server:  http://127.0.0.1:%d
   Metrics: http://127.0.0.1:%d

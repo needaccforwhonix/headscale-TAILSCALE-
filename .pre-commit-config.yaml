@@ -2,8 +2,9 @@
 # See: https://prek.j178.dev/quickstart/
 # See: https://prek.j178.dev/builtin/
 
-# Global exclusions - ignore generated code
-exclude: ^gen/
+# Global exclusions - ignore generated code (proto output and emitted OpenAPI)
+# and recorded golden fixtures.
+exclude: ^(gen|openapi)/|^hscontrol/testdata/apiv1_golden/
 
 repos:
   # Built-in hooks from pre-commit/pre-commit-hooks
@@ -13,6 +14,7 @@ repos:
     rev: v6.0.0
     hooks:
       - id: check-added-large-files
+        args: [--maxkb=1024]
       - id: check-case-conflict
       - id: check-executables-have-shebangs
       - id: check-json
@@ -59,4 +61,12 @@ repos:
         entry: nix develop --command -- golangci-lint run --new-from-rev=HEAD~1 --timeout=5m --fix
         language: system
         types: [go]
+        pass_filenames: false
+
+      # vendor-hash keeps flakehashes.json in sync with go.mod/go.sum.
+      - id: vendor-hash
+        name: vendor-hash
+        entry: nix develop --command -- go run ./cmd/vendorhash check
+        language: system
+        files: ^(go\.mod|go\.sum|flakehashes\.json)$
         pass_filenames: false

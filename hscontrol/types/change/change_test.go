@@ -1,12 +1,16 @@
 package change
 
 import (
+	"net/netip"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"tailscale.com/tailcfg"
+	"tailscale.com/types/key"
 )
 
 func TestChange_FieldSync(t *testing.T) {
@@ -85,6 +89,11 @@ func TestChange_IsEmpty(t *testing.T) {
 			want:     false,
 		},
 		{
+			name:     "DeletedNodes not empty",
+			response: Change{DeletedNodes: []types.NodeID{1}},
+			want:     false,
+		},
+		{
 			name:     "PeerPatches not empty",
 			response: Change{PeerPatches: []*tailcfg.PeerChange{{}}},
 			want:     false,
@@ -143,6 +152,11 @@ func TestChange_IsSelfOnly(t *testing.T) {
 		{
 			name:     "self only with PeersRemoved is not self only",
 			response: Change{TargetNode: 1, IncludeSelf: true, PeersRemoved: []types.NodeID{2}},
+			want:     false,
+		},
+		{
+			name:     "self only with DeletedNodes is not self only",
+			response: Change{TargetNode: 1, IncludeSelf: true, DeletedNodes: []types.NodeID{2}},
 			want:     false,
 		},
 		{
@@ -213,6 +227,12 @@ func TestChange_Merge(t *testing.T) {
 			r1:   Change{PeersRemoved: []types.NodeID{1, 2}},
 			r2:   Change{PeersRemoved: []types.NodeID{2, 3}},
 			want: Change{PeersRemoved: []types.NodeID{1, 2, 3}},
+		},
+		{
+			name: "deleted nodes deduplicated",
+			r1:   Change{DeletedNodes: []types.NodeID{1, 2}},
+			r2:   Change{DeletedNodes: []types.NodeID{2, 3}},
+			want: Change{DeletedNodes: []types.NodeID{1, 2, 3}},
 		},
 		{
 			name: "peer patches concatenated",
@@ -296,6 +316,99 @@ func TestChange_Merge(t *testing.T) {
 	}
 }
 
+func TestChange_IsBroadcastPolicyChange(t *testing.T) {
+	originUpdate := PolicyChange()
+	originUpdate.OriginNode = 7
+
+	targeted := PolicyChange()
+	targeted.TargetNode = 7
+
+	tests := []struct {
+		name string
+		c    Change
+		want bool
+	}{
+		{name: "policy change", c: PolicyChange(), want: true},
+		{name: "self-update recompute", c: originUpdate, want: false},
+		{name: "targeted recompute", c: targeted, want: false},
+		{name: "online patch", c: NodeOnline(1), want: false},
+		{name: "full update", c: FullUpdate(), want: false},
+		{name: "derp map", c: DERPMap(), want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, tt.c.IsBroadcastPolicyChange())
+		})
+	}
+}
+
+func TestDedupePolicyChanges(t *testing.T) {
+	// originRecompute is a runtime recompute carrying node-specific payload
+	// (OriginNode), so it is not the canonical broadcast PolicyChange and must
+	// never be coalesced away.
+	originRecompute := PolicyChange()
+	originRecompute.OriginNode = 7
+
+	tests := []struct {
+		name    string
+		changes []Change
+		want    []Change
+	}{
+		{
+			name:    "nil is a no-op",
+			changes: nil,
+			want:    nil,
+		},
+		{
+			name:    "single policy change is unchanged",
+			changes: []Change{PolicyChange()},
+			want:    []Change{PolicyChange()},
+		},
+		{
+			name:    "identical policy changes collapse to one",
+			changes: []Change{PolicyChange(), PolicyChange(), PolicyChange()},
+			want:    []Change{PolicyChange()},
+		},
+		{
+			name: "peer patches survive between collapsed policy changes",
+			changes: []Change{
+				NodeOnline(1), PolicyChange(), NodeOnline(2), PolicyChange(), NodeOffline(3),
+			},
+			want: []Change{
+				NodeOnline(1), PolicyChange(), NodeOnline(2), NodeOffline(3),
+			},
+		},
+		{
+			name:    "NodeAdded is preserved, not treated as a recompute",
+			changes: []Change{PolicyChange(), NodeAdded(5), PolicyChange()},
+			want:    []Change{PolicyChange(), NodeAdded(5)},
+		},
+		{
+			name:    "recompute carrying OriginNode is kept alongside the canonical one",
+			changes: []Change{PolicyChange(), originRecompute, PolicyChange()},
+			want:    []Change{PolicyChange(), originRecompute},
+		},
+		{
+			name:    "non-canonical recomputes are not collapsed",
+			changes: []Change{originRecompute, originRecompute},
+			want:    []Change{originRecompute, originRecompute},
+		},
+		{
+			name:    "changes without any recompute are unchanged",
+			changes: []Change{NodeOnline(1), DERPMap()},
+			want:    []Change{NodeOnline(1), DERPMap()},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := DedupePolicyChanges(tt.changes)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
 func TestChange_Constructors(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -361,14 +474,6 @@ func TestPolicyAndPeers(t *testing.T) {
 	assert.Equal(t, []types.NodeID{1, 2, 3}, r.PeersChanged)
 }
 
-func TestVisibilityChange(t *testing.T) {
-	r := VisibilityChange("tag change", []types.NodeID{1}, []types.NodeID{2, 3})
-	assert.Equal(t, "tag change", r.Reason)
-	assert.True(t, r.IncludePolicy)
-	assert.Equal(t, []types.NodeID{1}, r.PeersChanged)
-	assert.Equal(t, []types.NodeID{2, 3}, r.PeersRemoved)
-}
-
 func TestPeersChanged(t *testing.T) {
 	r := PeersChanged("routes approved", 1, 2)
 	assert.Equal(t, "routes approved", r.Reason)
@@ -380,6 +485,13 @@ func TestPeersRemoved(t *testing.T) {
 	r := PeersRemoved(1, 2, 3)
 	assert.Equal(t, "peers removed", r.Reason)
 	assert.Equal(t, []types.NodeID{1, 2, 3}, r.PeersRemoved)
+}
+
+func TestNodeRemoved(t *testing.T) {
+	r := NodeRemoved(42)
+	assert.Equal(t, "node removed", r.Reason)
+	assert.Equal(t, []types.NodeID{42}, r.PeersRemoved)
+	assert.Equal(t, []types.NodeID{42}, r.DeletedNodes)
 }
 
 func TestPeerPatched(t *testing.T) {
@@ -449,9 +561,9 @@ func TestChange_Type(t *testing.T) {
 			want: "ping",
 		},
 		{
-			name:     "empty is unknown",
+			name:     "empty",
 			response: Change{},
-			want:     "unknown",
+			want:     "empty",
 		},
 	}
 
@@ -518,4 +630,74 @@ func TestUniqueNodeIDs(t *testing.T) {
 			assert.Equal(t, tt.want, got)
 		})
 	}
+}
+
+func TestNodeOnlineOfflineForSubnetRouter(t *testing.T) {
+	route := netip.MustParsePrefix("10.0.0.0/24")
+	router := types.Node{
+		ID:             1,
+		Hostinfo:       &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{route}},
+		ApprovedRoutes: []netip.Prefix{route},
+	}
+	view := router.View()
+	require.True(t, view.IsSubnetRouter(), "test node must be a subnet router")
+
+	tests := []struct {
+		name       string
+		got        Change
+		wantOnline bool
+	}{
+		{name: "online", got: NodeOnline(view.ID()), wantOnline: true},
+		{name: "offline", got: NodeOffline(view.ID()), wantOnline: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// A subnet router's online/offline transition rides the lightweight
+			// peer patch, not a full update: the gated PolicyChange that
+			// State.Connect/Disconnect emit owns the netmap recompute.
+			assert.False(t, tt.got.IsFull(),
+				"subnet router online/offline must be a peer patch, not a full update")
+
+			require.NotEmpty(t, tt.got.PeerPatches,
+				"expected an online/offline peer patch")
+
+			patch := tt.got.PeerPatches[0]
+			assert.Equal(t, view.ID().NodeID(), patch.NodeID)
+
+			require.NotNil(t, patch.Online)
+			assert.Equal(t, tt.wantOnline, *patch.Online)
+		})
+	}
+}
+
+// TestNodeKeyRotatedEmitsPatchNotWholeNode proves a relogin is delivered to
+// peers as an incremental peer patch, not a whole-node add. A whole-node add is
+// non-patchifiable on the tailscale client whenever Hostinfo changed (which it
+// does on relogin), forcing the broken NodeMutationAdd path that strands a
+// re-keyed, momentarily-endpoint-less peer.
+func TestNodeKeyRotatedEmitsPatchNotWholeNode(t *testing.T) {
+	expiry := time.Now().Add(24 * time.Hour).UTC()
+	node := types.Node{
+		ID:        7,
+		NodeKey:   key.NewNode().Public(),
+		DiscoKey:  key.NewDisco().Public(),
+		Endpoints: []netip.AddrPort{netip.MustParseAddrPort("192.168.1.9:41641")},
+		Expiry:    &expiry,
+	}
+	view := node.View()
+
+	c := NodeKeyRotated(view)
+
+	assert.False(t, c.IsFull(), "relogin must be a peer patch, not a full update")
+	assert.Empty(t, c.PeersChanged, "relogin must not emit a whole-node PeersChanged")
+	require.Len(t, c.PeerPatches, 1, "relogin must emit exactly one peer patch")
+
+	patch := c.PeerPatches[0]
+	assert.Equal(t, view.ID().NodeID(), patch.NodeID)
+	require.NotNil(t, patch.Key, "patch must carry the rotated NodeKey")
+	assert.Equal(t, node.NodeKey, *patch.Key)
+	require.NotNil(t, patch.KeyExpiry, "patch must carry KeyExpiry to (un)expire the peer")
+	assert.Equal(t, expiry, *patch.KeyExpiry)
+	assert.Equal(t, []netip.AddrPort(node.Endpoints), patch.Endpoints, "patch must carry endpoints")
 }

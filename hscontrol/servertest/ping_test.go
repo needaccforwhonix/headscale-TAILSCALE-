@@ -1,6 +1,8 @@
 package servertest_test
 
 import (
+	"context"
+	"net/http"
 	"testing"
 	"time"
 
@@ -13,7 +15,7 @@ import (
 )
 
 // TestPingNode verifies the full ping round-trip: the server sends a
-// PingRequest via MapResponse, the real controlclient.Direct handles it
+// [tailcfg.PingRequest] via [tailcfg.MapResponse], the real [controlclient.Direct] handles it
 // by making a HEAD request back over Noise, and the ping tracker records
 // the latency.
 func TestPingNode(t *testing.T) {
@@ -103,7 +105,7 @@ func TestPingTwoSameNode(t *testing.T) {
 
 	require.NotEqual(t, pingID1, pingID2)
 
-	// Send both PingRequests.
+	// Send both [tailcfg.PingRequest]s.
 	url1 := h.Server.URL + "/machine/ping-response?id=" + pingID1
 	url2 := h.Server.URL + "/machine/ping-response?id=" + pingID2
 
@@ -134,7 +136,7 @@ func TestPingTwoSameNode(t *testing.T) {
 	}
 }
 
-// TestPingResolveByHostname verifies that ResolveNode can find a node
+// TestPingResolveByHostname verifies that [state.State.ResolveNode] can find a node
 // by hostname and that the resolved node can be pinged.
 func TestPingResolveByHostname(t *testing.T) {
 	t.Parallel()
@@ -165,5 +167,35 @@ func TestPingResolveByHostname(t *testing.T) {
 		assert.Positive(t, latency)
 	case <-time.After(15 * time.Second):
 		t.Fatal("ping response not received")
+	}
+}
+
+// TestPingResponseHandlerRejectsNonHEAD verifies the endpoint returns 405
+// for method verbs other than HEAD, even when chi is configured to allow
+// them.
+func TestPingResponseHandlerRejectsNonHEAD(t *testing.T) {
+	t.Parallel()
+
+	h := servertest.NewHarness(t, 1)
+
+	for _, method := range []string{http.MethodGet, http.MethodPost, http.MethodPut} {
+		t.Run(method, func(t *testing.T) {
+			t.Parallel()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			req, err := http.NewRequestWithContext(ctx, method, h.Server.URL+"/machine/ping-response?id=x", nil)
+			require.NoError(t, err)
+
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				// chi may refuse the method entirely; that's equivalent to 405.
+				return
+			}
+			defer resp.Body.Close()
+
+			assert.Equal(t, http.StatusMethodNotAllowed, resp.StatusCode)
+		})
 	}
 }

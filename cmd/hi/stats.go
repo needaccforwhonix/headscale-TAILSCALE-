@@ -1,12 +1,14 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -160,7 +162,7 @@ func (sc *StatsCollector) monitorDockerEvents(ctx context.Context, runID string,
 					continue
 				}
 
-				// Convert to types.Container format for consistency
+				// Convert to [types.Container] format for consistency
 				cont := types.Container{ //nolint:staticcheck // SA1019: use container.Summary
 					ID:     containerInfo.ID,
 					Names:  []string{containerInfo.Name},
@@ -256,8 +258,8 @@ func (sc *StatsCollector) collectStatsForContainer(ctx context.Context, containe
 
 			err := decoder.Decode(&stats)
 			if err != nil {
-				// EOF is expected when container stops or stream ends
-				if err.Error() != "EOF" && verbose {
+				// [io.EOF] is expected when container stops or stream ends
+				if !errors.Is(err, io.EOF) && verbose {
 					log.Printf("Failed to decode stats for container %s: %v", containerID[:12], err)
 				}
 
@@ -312,7 +314,7 @@ func calculateCPUPercent(prevStats, stats *container.Stats) float64 { //nolint:s
 		// Calculate CPU percentage: (container CPU delta / system CPU delta) * number of CPUs * 100
 		numCPUs := float64(len(stats.CPUStats.CPUUsage.PercpuUsage))
 		if numCPUs == 0 {
-			// Fallback: if PercpuUsage is not available, assume 1 CPU
+			// Fallback: if [PercpuUsage] is not available, assume 1 CPU
 			numCPUs = 1.0
 		}
 
@@ -374,24 +376,24 @@ func (sc *StatsCollector) GetSummary() []ContainerStatsSummary {
 			SampleCount:   len(stats),
 		}
 
-		// Calculate CPU stats
-		cpuValues := make([]float64, len(stats))
-		memoryValues := make([]float64, len(stats))
+		extract := func(get func(StatsSample) float64) []float64 {
+			values := make([]float64, len(stats))
+			for i, sample := range stats {
+				values[i] = get(sample)
+			}
 
-		for i, sample := range stats {
-			cpuValues[i] = sample.CPUUsage
-			memoryValues[i] = sample.MemoryMB
+			return values
 		}
 
-		summary.CPU = calculateStatsSummary(cpuValues)
-		summary.Memory = calculateStatsSummary(memoryValues)
+		summary.CPU = calculateStatsSummary(extract(func(s StatsSample) float64 { return s.CPUUsage }))
+		summary.Memory = calculateStatsSummary(extract(func(s StatsSample) float64 { return s.MemoryMB }))
 
 		summaries = append(summaries, summary)
 	}
 
 	// Sort by container name for consistent output
-	sort.Slice(summaries, func(i, j int) bool {
-		return summaries[i].ContainerName < summaries[j].ContainerName
+	slices.SortFunc(summaries, func(a, b ContainerStatsSummary) int {
+		return cmp.Compare(a.ContainerName, b.ContainerName)
 	})
 
 	return summaries
@@ -408,14 +410,8 @@ func calculateStatsSummary(values []float64) StatsSummary {
 	sum := 0.0
 
 	for _, value := range values {
-		if value < minVal {
-			minVal = value
-		}
-
-		if value > maxVal {
-			maxVal = value
-		}
-
+		minVal = min(minVal, value)
+		maxVal = max(maxVal, value)
 		sum += value
 	}
 

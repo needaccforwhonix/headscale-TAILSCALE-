@@ -3,26 +3,31 @@ package hscontrol
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strconv"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/juanfont/headscale/hscontrol/types"
+	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
+	"tailscale.com/util/zstdframe"
 )
 
 // newNoiseRouterWithBodyLimit builds a chi router with the same body-limit
 // middleware used in the real Noise router but wired to a test handler that
-// captures the io.ReadAll result. This lets us verify the limit without
-// needing a full Headscale instance.
+// captures the [io.ReadAll] result. This lets us verify the limit without
+// needing a full [Headscale] instance.
 func newNoiseRouterWithBodyLimit(readBody *[]byte, readErr *error) http.Handler {
 	r := chi.NewRouter()
 	r.Use(func(next http.Handler) http.Handler {
@@ -159,7 +164,7 @@ func TestNoiseBodyLimit_AtExactLimit(t *testing.T) {
 }
 
 // TestPollNetMapHandler_OversizedBody calls the real handler with a
-// MaxBytesReader-wrapped body to verify it fails gracefully (json decode
+// [http.MaxBytesReader]-wrapped body to verify it fails gracefully (json decode
 // error on truncated data) rather than consuming unbounded memory.
 func TestPollNetMapHandler_OversizedBody(t *testing.T) {
 	t.Parallel()
@@ -173,12 +178,12 @@ func TestPollNetMapHandler_OversizedBody(t *testing.T) {
 
 	ns.PollNetMapHandler(rec, req)
 
-	// Body is truncated → json.Decode fails → httpError returns 500.
+	// Body is truncated → [json.Decoder.Decode] fails → [httpError] returns 500.
 	assert.Equal(t, http.StatusInternalServerError, rec.Code)
 }
 
 // TestRegistrationHandler_OversizedBody calls the real handler with a
-// MaxBytesReader-wrapped body to verify it returns an error response
+// [http.MaxBytesReader]-wrapped body to verify it returns an error response
 // rather than consuming unbounded memory.
 func TestRegistrationHandler_OversizedBody(t *testing.T) {
 	t.Parallel()
@@ -192,19 +197,56 @@ func TestRegistrationHandler_OversizedBody(t *testing.T) {
 
 	ns.RegistrationHandler(rec, req)
 
-	// json.Decode returns MaxBytesError → regErr wraps it → handler writes
-	// a RegisterResponse with the error and then rejectUnsupported kicks in
+	// [json.Decoder.Decode] returns [http.MaxBytesError] → [regErr] wraps it → handler writes
+	// a [tailcfg.RegisterResponse] with the error and then [rejectUnsupported] kicks in
 	// for version 0 → returns 400.
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
 }
 
+// TestSSHActionRoute_OldPathReturns404 pins the wire-format shape of the
+// SSH check-action endpoint. Pre-alignment headscale served
+// /machine/ssh/action/from/{src}/to/{dst}?ssh_user=...; the current
+// endpoint is /machine/ssh/action/{src}/to/{dst}?local_user=.... If
+// someone re-adds the old route shape, this fails.
+func TestSSHActionRoute_OldPathReturns404(t *testing.T) {
+	t.Parallel()
+
+	r := chi.NewRouter()
+	r.Route("/machine", func(r chi.Router) {
+		r.Get("/ssh/action/{src_node_id}/to/{dst_node_id}", func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		})
+	})
+
+	cases := []struct {
+		name string
+		path string
+		want int
+	}{
+		{"new", "/machine/ssh/action/1/to/2", http.StatusOK},
+		{"old-with-from", "/machine/ssh/action/from/1/to/2", http.StatusNotFound},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, tc.path, nil)
+			rec := httptest.NewRecorder()
+			r.ServeHTTP(rec, req)
+
+			assert.Equal(t, tc.want, rec.Code)
+		})
+	}
+}
+
 // newSSHActionRequest builds an httptest request with the chi URL params
-// SSHActionHandler reads (src_node_id and dst_node_id), so the handler
+// [noiseServer.SSHActionHandler] reads (src_node_id and dst_node_id), so the handler
 // can be exercised directly without going through the chi router.
 func newSSHActionRequest(t *testing.T, src, dst types.NodeID) *http.Request {
 	t.Helper()
 
-	url := fmt.Sprintf("/machine/ssh/action/from/%d/to/%d", src.Uint64(), dst.Uint64())
+	url := fmt.Sprintf("/machine/ssh/action/%d/to/%d", src.Uint64(), dst.Uint64())
 	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, url, nil)
 
 	rctx := chi.NewRouteContext()
@@ -216,8 +258,8 @@ func newSSHActionRequest(t *testing.T, src, dst types.NodeID) *http.Request {
 }
 
 // putTestNodeInStore creates a node via the database test helper and
-// also stages it into the in-memory NodeStore so handlers that read
-// NodeStore-backed APIs (e.g. State.GetNodeByID) can see it.
+// also stages it into the in-memory [state.NodeStore] so handlers that read
+// [state.NodeStore]-backed APIs (e.g. [state.State.GetNodeByID]) can see it.
 func putTestNodeInStore(t *testing.T, app *Headscale, user *types.User, hostname string) *types.Node {
 	t.Helper()
 
@@ -239,7 +281,7 @@ func TestSSHActionHandler_RejectsRogueMachineKey(t *testing.T) {
 	src := putTestNodeInStore(t, app, user, "src-node")
 	dst := putTestNodeInStore(t, app, user, "dst-node")
 
-	// noiseServer carries the wrong machine key — a fresh throwaway key,
+	// [noiseServer] carries the wrong machine key — a fresh throwaway key,
 	// not dst.MachineKey.
 	rogue := key.NewMachine().Public()
 	require.NotEqual(t, dst.MachineKey, rogue, "test sanity: rogue key must differ from dst")
@@ -315,7 +357,7 @@ func TestSSHActionFollowUp_RejectsBindingMismatch(t *testing.T) {
 	}
 
 	url := fmt.Sprintf(
-		"/machine/ssh/action/from/%d/to/%d?auth_id=%s",
+		"/machine/ssh/action/%d/to/%d?auth_id=%s",
 		srcOther.ID.Uint64(), dstOther.ID.Uint64(), authID.String(),
 	)
 	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, url, nil)
@@ -330,4 +372,279 @@ func TestSSHActionFollowUp_RejectsBindingMismatch(t *testing.T) {
 
 	assert.Equal(t, http.StatusUnauthorized, rec.Code,
 		"binding mismatch must be rejected with 401")
+}
+
+// TestOverrideRemoteAddr asserts the middleware used inside the Noise
+// tunnel pins r.RemoteAddr to the value captured from the outer
+// (pre-hijack) request, so /machine/* requests log the trusted-proxy
+// resolved client IP instead of the hijacked TCP socket's loopback peer.
+func TestOverrideRemoteAddr(t *testing.T) {
+	t.Parallel()
+
+	const clientAddr = "192.168.91.240"
+
+	r := chi.NewRouter()
+	r.Use(overrideRemoteAddr(clientAddr))
+
+	var observed string
+
+	r.Get("/x", func(w http.ResponseWriter, r *http.Request) {
+		observed = r.RemoteAddr
+
+		w.WriteHeader(http.StatusOK)
+	})
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/x", nil)
+	req.RemoteAddr = "127.0.0.1:44388"
+
+	r.ServeHTTP(httptest.NewRecorder(), req)
+
+	assert.Equal(t, clientAddr, observed)
+}
+
+// TestSSHActionHoldAndDelegate_PersistsAuthSession guards the happy path: the
+// initial SSH-check poll returns a HoldAndDelegate URL carrying an auth_id, and
+// that auth session must remain in the cache for the follow-up poll to find.
+func TestSSHActionHoldAndDelegate_PersistsAuthSession(t *testing.T) {
+	t.Parallel()
+
+	app := createTestApp(t)
+	user := app.state.CreateUserForTest("ssh-persist-user")
+	src := putTestNodeInStore(t, app, user, "src-node")
+	dst := putTestNodeInStore(t, app, user, "dst-node")
+
+	ns := &noiseServer{headscale: app, machineKey: dst.MachineKey}
+
+	rec := httptest.NewRecorder()
+	ns.SSHActionHandler(rec, newSSHActionRequest(t, src.ID, dst.ID))
+	require.Equal(t, http.StatusOK, rec.Code, "initial poll body=%s", rec.Body.String())
+
+	var action tailcfg.SSHAction
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &action))
+	require.NotEmpty(t, action.HoldAndDelegate, "expected HoldAndDelegate, got %+v", action)
+
+	u, err := url.Parse(action.HoldAndDelegate)
+	require.NoError(t, err)
+
+	authIDStr := u.Query().Get("auth_id")
+	require.NotEmpty(t, authIDStr, "HoldAndDelegate URL missing auth_id: %s", action.HoldAndDelegate)
+
+	authID, err := types.AuthIDFromString(authIDStr)
+	require.NoError(t, err)
+
+	_, ok := app.state.GetAuthCacheEntry(authID)
+	require.True(t, ok, "auth session %s must persist after HoldAndDelegate", authID)
+}
+
+// TestSSHActionHandler_RejectsMissingSessionWithoutCheck verifies that without
+// an SSH check covering the pair, a follow-up poll for an unknown auth_id is a
+// genuinely bogus request and is rejected. The re-delegation behaviour for a
+// missing session (issue #3305, exercised end to end with a real client in the
+// servertest package) applies only when the pair is still subject to a check.
+func TestSSHActionHandler_RejectsMissingSessionWithoutCheck(t *testing.T) {
+	t.Parallel()
+
+	app := createTestApp(t)
+	user := app.state.CreateUserForTest("ssh-nocheck-user")
+	src := putTestNodeInStore(t, app, user, "src-node")
+	dst := putTestNodeInStore(t, app, user, "dst-node")
+
+	// No SSH-check policy is set, so the pair is not subject to a check.
+	_, checkFound := app.state.SSHCheckParams(src.ID, dst.ID)
+	require.False(t, checkFound, "test setup: pair must not be subject to a check")
+
+	ns := &noiseServer{headscale: app, machineKey: dst.MachineKey}
+
+	missing := types.MustAuthID()
+
+	rec := httptest.NewRecorder()
+	ns.SSHActionHandler(rec, newSSHActionFollowUpRequest(t, src.ID, dst.ID, missing))
+	require.Equal(t, http.StatusBadRequest, rec.Code,
+		"a bogus auth_id with no active check must be rejected, body=%s", rec.Body.String())
+}
+
+// TestTS2021Route_AcceptsGETAndPOST reproduces a regression where the
+// browser/WASM control client could not connect. Tailscale's JS/WASM control
+// client opens /ts2021 as a WebSocket, which is an HTTP GET upgrade; the native
+// Go client uses an HTTP POST upgrade. The gorilla->chi router migration
+// registered /ts2021 for POST only, so the GET WebSocket handshake was rejected
+// with 405 Method Not Allowed by the router before it could reach
+// NoiseUpgradeHandler. Both methods must route to the handler.
+//
+// NoiseUpgradeHandler dispatches on the Upgrade header, not the HTTP method, so
+// once the route is reachable the handler handles both upgrade styles. The
+// httptest recorder is not an http.Hijacker, so the upgrade itself fails past
+// the router (501 for the WebSocket path, 400 for the native path) — the point
+// is only that neither is 405, i.e. the router no longer rejects GET early.
+func TestTS2021Route_AcceptsGETAndPOST(t *testing.T) {
+	t.Parallel()
+
+	handler := createTestApp(t).HTTPHandler()
+
+	tests := []struct {
+		name    string
+		method  string
+		headers map[string]string
+	}{
+		{
+			name:   "websocket_get_from_wasm_client",
+			method: http.MethodGet,
+			headers: map[string]string{
+				"Connection":             "Upgrade",
+				"Upgrade":                "websocket",
+				"Sec-WebSocket-Version":  "13",
+				"Sec-WebSocket-Key":      "dGhlIHNhbXBsZSBub25jZQ==",
+				"Sec-WebSocket-Protocol": "tailscale-control-protocol",
+			},
+		},
+		{
+			name:   "native_post_upgrade",
+			method: http.MethodPost,
+			headers: map[string]string{
+				"Connection":            "upgrade",
+				"Upgrade":               "tailscale-control-protocol",
+				"X-Tailscale-Handshake": "AAAA",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			req := httptest.NewRequestWithContext(context.Background(), tt.method,
+				"/ts2021?X-Tailscale-Handshake=AAAA", nil)
+			for k, v := range tt.headers {
+				req.Header.Set(k, v)
+			}
+
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+
+			assert.NotEqual(t, http.StatusMethodNotAllowed, rec.Code,
+				"%s /ts2021 must reach NoiseUpgradeHandler, not be rejected by the router with 405",
+				tt.method)
+		})
+	}
+}
+
+// newSSHActionFollowUpRequest is like newSSHActionRequest but carries the
+// auth_id query parameter that marks a follow-up poll.
+func newSSHActionFollowUpRequest(t *testing.T, src, dst types.NodeID, authID types.AuthID) *http.Request {
+	t.Helper()
+
+	req := newSSHActionRequest(t, src, dst)
+
+	q := req.URL.Query()
+	q.Set("auth_id", authID.String())
+	req.URL.RawQuery = q.Encode()
+
+	return req
+}
+
+// newMapRequest builds a streaming [tailcfg.MapRequest] POST for
+// /machine/map. Version is mandatory: [rejectUnsupported] runs before the
+// handler looks the node up, and a zero version is rejected with 400.
+func newMapRequest(t *testing.T, req tailcfg.MapRequest) *http.Request {
+	t.Helper()
+
+	body, err := json.Marshal(req)
+	require.NoError(t, err)
+
+	return httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/machine/map", bytes.NewReader(body))
+}
+
+// decodeMapResponse reads a map response frame the way a Tailscale client
+// does: a little-endian length prefix followed by a body that is zstd-framed
+// whenever the request asked for compression.
+func decodeMapResponse(t *testing.T, compress string, body []byte) tailcfg.MapResponse {
+	t.Helper()
+
+	require.GreaterOrEqual(t, len(body), reservedResponseHeaderSize, "response too short to carry a length prefix")
+
+	size := binary.LittleEndian.Uint32(body[:reservedResponseHeaderSize])
+	payload := body[reservedResponseHeaderSize:]
+	require.Len(t, payload, int(size), "length prefix must match the body it precedes")
+
+	if compress == util.ZstdCompression {
+		decoded, err := zstdframe.AppendDecode(nil, payload)
+		require.NoError(t, err, "client decodes every frame as zstd when it asked for zstd")
+
+		payload = decoded
+	}
+
+	var resp tailcfg.MapResponse
+	require.NoError(t, json.Unmarshal(payload, &resp))
+
+	return resp
+}
+
+// TestPollNetMapHandler_DeletedNodeGetsExpiredSelf verifies that a streaming
+// map request for a node that no longer exists is answered with an expired
+// self node instead of a bare 404. A Tailscale client treats every non-200 on
+// the map path identically and retries forever with loggedIn still set; only a
+// self node whose KeyExpiry is in the past moves it to NeedsLogin.
+//
+// See: https://github.com/juanfont/headscale/issues/3410
+func TestPollNetMapHandler_DeletedNodeGetsExpiredSelf(t *testing.T) {
+	t.Parallel()
+
+	for _, compress := range []string{"", util.ZstdCompression} {
+		t.Run("compress="+compress, func(t *testing.T) {
+			t.Parallel()
+
+			app := createTestApp(t)
+			user := app.state.CreateUserForTest("deleted-node-user")
+			node := putTestNodeInStore(t, app, user, "deleted-node")
+
+			nodeView, ok := app.state.GetNodeByID(node.ID)
+			require.True(t, ok)
+
+			_, err := app.state.DeleteNode(nodeView)
+			require.NoError(t, err)
+
+			ns := &noiseServer{headscale: app, machineKey: node.MachineKey}
+
+			rec := httptest.NewRecorder()
+			ns.PollNetMapHandler(rec, newMapRequest(t, tailcfg.MapRequest{
+				Version:  tailcfg.CurrentCapabilityVersion,
+				NodeKey:  node.NodeKey,
+				Stream:   true,
+				Compress: compress,
+			}))
+
+			require.Equal(t, http.StatusOK, rec.Code, "body=%q", rec.Body.String())
+
+			resp := decodeMapResponse(t, compress, rec.Body.Bytes())
+			require.NotNil(t, resp.Node, "clients reject an initial map response without a node")
+			assert.Equal(t, node.NodeKey, resp.Node.Key)
+			assert.Equal(t, time.Unix(1, 0).UTC(), resp.Node.KeyExpiry,
+				"a fixed ancient KeyExpiry must remain expired despite client clock skew")
+			assert.True(t, resp.Node.Expired)
+		})
+	}
+}
+
+// TestPollNetMapHandler_ForeignMachineKeyStillRejected pins that the
+// expired-self response is limited to a genuinely unknown node. A known
+// NodeKey presented by the wrong machine key is an impostor, and answering it
+// with "your key expired" would wipe the real client's persisted node ID.
+func TestPollNetMapHandler_ForeignMachineKeyStillRejected(t *testing.T) {
+	t.Parallel()
+
+	app := createTestApp(t)
+	user := app.state.CreateUserForTest("impostor-user")
+	victim := putTestNodeInStore(t, app, user, "victim-node")
+	impostor := putTestNodeInStore(t, app, user, "impostor-node")
+
+	ns := &noiseServer{headscale: app, machineKey: impostor.MachineKey}
+
+	rec := httptest.NewRecorder()
+	ns.PollNetMapHandler(rec, newMapRequest(t, tailcfg.MapRequest{
+		Version: tailcfg.CurrentCapabilityVersion,
+		NodeKey: victim.NodeKey,
+		Stream:  true,
+	}))
+
+	assert.Equal(t, http.StatusNotFound, rec.Code, "body=%q", rec.Body.String())
 }

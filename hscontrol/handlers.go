@@ -19,17 +19,6 @@ import (
 )
 
 const (
-	// NoiseCapabilityVersion is used by Tailscale clients to indicate
-	// their codebase version. Tailscale clients can communicate over TS2021
-	// from CapabilityVersion 28, but we only have good support for it
-	// since https://github.com/tailscale/tailscale/pull/4323 (Noise in any HTTPS port).
-	//
-	// Related to this change, there is https://github.com/tailscale/tailscale/pull/5379,
-	// where CapabilityVersion 39 is introduced to indicate #4323 was merged.
-	//
-	// See also https://github.com/tailscale/tailscale/blob/main/tailcfg/tailcfg.go
-	NoiseCapabilityVersion = 39
-
 	reservedResponseHeaderSize = 4
 )
 
@@ -51,18 +40,23 @@ func httpError(w http.ResponseWriter, err error) {
 // an actionable message derived from the HTTP status code.
 func httpUserError(w http.ResponseWriter, err error) {
 	code := http.StatusInternalServerError
+	userMsg := ""
 
 	if herr, ok := errors.AsType[HTTPError](err); ok {
 		if herr.Code != 0 {
 			code = herr.Code
 		}
 
+		userMsg = herr.UserMsg
+
 		log.Error().Err(herr.Err).Int("code", code).Msgf("user msg: %s", herr.Msg)
 	} else {
 		log.Error().Err(err).Int("code", code).Msg("http internal server error")
 	}
 
-	userMsg := userMessageForStatusCode(code)
+	if userMsg == "" {
+		userMsg = userMessageForStatusCode(code)
+	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(code)
@@ -94,9 +88,10 @@ func userMessageForStatusCode(code int) string {
 
 // HTTPError represents an error that is surfaced to the user via web.
 type HTTPError struct {
-	Code int    // HTTP response code to send to client; 0 means 500
-	Msg  string // Response body to send to client
-	Err  error  // Detailed error to log on the server
+	Code    int    // HTTP response code to send to client; 0 means 500
+	Msg     string // Response body to send to non-browser clients
+	Err     error  // Detailed error to log on the server
+	UserMsg string // Optional safe message for browser-facing error pages
 }
 
 func (e HTTPError) Error() string { return fmt.Sprintf("http error[%d]: %s, %s", e.Code, e.Msg, e.Err) }
@@ -105,6 +100,10 @@ func (e HTTPError) Unwrap() error { return e.Err }
 // NewHTTPError returns an HTTPError containing the given information.
 func NewHTTPError(code int, msg string, err error) HTTPError {
 	return HTTPError{Code: code, Msg: msg, Err: err}
+}
+
+func newHTTPUserError(code int, msg, userMsg string, err error) HTTPError {
+	return HTTPError{Code: code, Msg: msg, Err: err, UserMsg: userMsg}
 }
 
 var errMethodNotAllowed = NewHTTPError(http.StatusMethodNotAllowed, "method not allowed", nil)
@@ -129,7 +128,7 @@ func parseCapabilityVersion(req *http.Request) (tailcfg.CapabilityVersion, error
 }
 
 // verifyBodyLimit caps the request body for /verify. The DERP verify
-// protocol payload (tailcfg.DERPAdmitClientRequest) is a few hundred
+// protocol payload ([tailcfg.DERPAdmitClientRequest]) is a few hundred
 // bytes; 4 KiB is generous and prevents an unauthenticated client from
 // OOMing the public router with arbitrarily large POSTs.
 const verifyBodyLimit int64 = 4 * 1024
@@ -148,20 +147,12 @@ func (h *Headscale) handleVerifyRequest(
 		return NewHTTPError(http.StatusBadRequest, "Bad Request: invalid JSON", fmt.Errorf("parsing DERP client request: %w", err))
 	}
 
-	nodes := h.state.ListNodes()
-
-	// Check if any node has the requested NodeKey
-	var nodeKeyFound bool
-
-	for _, node := range nodes.All() {
-		if node.NodeKey() == derpAdmitClientRequest.NodePublic {
-			nodeKeyFound = true
-			break
-		}
-	}
+	allow := h.state.ListNodes().ContainsFunc(func(n types.NodeView) bool {
+		return n.NodeKey() == derpAdmitClientRequest.NodePublic
+	})
 
 	resp := &tailcfg.DERPAdmitClientResponse{
-		Allow: nodeKeyFound,
+		Allow: allow,
 	}
 
 	return json.NewEncoder(writer).Encode(resp)
@@ -180,13 +171,18 @@ func (h *Headscale) VerifyHandler(
 
 	req.Body = http.MaxBytesReader(writer, req.Body, verifyBodyLimit)
 
+	// Set the Content-Type before any body byte is written. The first
+	// Write in handleVerifyRequest triggers an implicit WriteHeader that
+	// snapshots the header map, so setting it afterwards is a no-op. The
+	// error path resets the Content-Type via http.Error, so error
+	// responses remain text/plain.
+	writer.Header().Set("Content-Type", "application/json")
+
 	err := h.handleVerifyRequest(req, writer)
 	if err != nil {
 		httpError(writer, err)
 		return
 	}
-
-	writer.Header().Set("Content-Type", "application/json")
 }
 
 // KeyHandler provides the Headscale pub key
@@ -202,20 +198,27 @@ func (h *Headscale) KeyHandler(
 		return
 	}
 
-	// TS2021 (Tailscale v2 protocol) requires to have a different key
-	if capVer >= NoiseCapabilityVersion {
-		resp := tailcfg.OverTLSPublicKeyResponse{
-			PublicKey: h.noisePrivateKey.Public(),
-		}
-
-		writer.Header().Set("Content-Type", "application/json")
-
-		err := json.NewEncoder(writer).Encode(resp)
-		if err != nil {
-			log.Error().Err(err).Msg("failed to encode public key response")
-		}
-
+	// Only disclose the Noise public key to clients this server can
+	// actually complete a handshake with. Gating on the same floor the
+	// Noise handshake enforces (capver.MinSupportedCapabilityVersion, see
+	// isSupportedVersion in noise.go) keeps /key consistent with /ts2021:
+	// versions the handshake would reject get a clear rejection here
+	// instead of a key that only serves as a version-boundary oracle.
+	// See https://github.com/juanfont/headscale/issues/3380.
+	if !isSupportedVersion(capVer) {
+		httpError(writer, NewHTTPError(http.StatusBadRequest, "unsupported client version", unsupportedClientError(capVer)))
 		return
+	}
+
+	resp := tailcfg.OverTLSPublicKeyResponse{
+		PublicKey: h.noisePrivateKey.Public(),
+	}
+
+	writer.Header().Set("Content-Type", "application/json")
+
+	err = json.NewEncoder(writer).Encode(resp)
+	if err != nil {
+		log.Error().Err(err).Msg("failed to encode public key response")
 	}
 }
 
@@ -300,18 +303,23 @@ func NewAuthProviderWeb(serverURL string) *AuthProviderWeb {
 	}
 }
 
-func (a *AuthProviderWeb) RegisterURL(authID types.AuthID) string {
+// authPathURL builds an auth-flow URL of the form
+// "<serverURL>/<kind>/<id>", trimming a trailing slash from serverURL.
+func authPathURL(serverURL, kind string, authID types.AuthID) string {
 	return fmt.Sprintf(
-		"%s/register/%s",
-		strings.TrimSuffix(a.serverURL, "/"),
-		authID.String())
+		"%s/%s/%s",
+		strings.TrimSuffix(serverURL, "/"),
+		kind,
+		authID.String(),
+	)
+}
+
+func (a *AuthProviderWeb) RegisterURL(authID types.AuthID) string {
+	return authPathURL(a.serverURL, "register", authID)
 }
 
 func (a *AuthProviderWeb) AuthURL(authID types.AuthID) string {
-	return fmt.Sprintf(
-		"%s/auth/%s",
-		strings.TrimSuffix(a.serverURL, "/"),
-		authID.String())
+	return authPathURL(a.serverURL, "auth", authID)
 }
 
 func (a *AuthProviderWeb) AuthHandler(
@@ -338,7 +346,7 @@ func (a *AuthProviderWeb) AuthHandler(
 }
 
 func authIDFromRequest(req *http.Request) (types.AuthID, error) {
-	raw, err := urlParam[string](req, "auth_id")
+	raw, err := stringParam(req, "auth_id")
 	if err != nil {
 		return "", NewHTTPError(http.StatusBadRequest, "invalid auth id", fmt.Errorf("parsing auth_id from URL: %w", err))
 	}
@@ -358,7 +366,7 @@ func authIDFromRequest(req *http.Request) (types.AuthID, error) {
 // Listens in /register/:registration_id.
 //
 // This is not part of the Tailscale control API, as we could send whatever URL
-// in the RegisterResponse.AuthURL field.
+// in the [tailcfg.RegisterResponse.AuthURL] field.
 func (a *AuthProviderWeb) RegisterHandler(
 	writer http.ResponseWriter,
 	req *http.Request,

@@ -16,7 +16,6 @@ import (
 	"github.com/juanfont/headscale/hscontrol/state"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/types/change"
-	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"tailscale.com/tailcfg"
@@ -67,7 +66,7 @@ func (t *testBatcherWrapper) AddNode(id types.NodeID, c chan<- *tailcfg.MapRespo
 		return fmt.Errorf("%w: %d", errNodeNotFoundAfterAdd, id)
 	}
 
-	t.AddWork(change.NodeOnlineFor(node))
+	t.AddWork(change.NodeOnline(node.ID()))
 
 	return nil
 }
@@ -91,7 +90,7 @@ func (t *testBatcherWrapper) RemoveNode(id types.NodeID, c chan<- *tailcfg.MapRe
 	// Do this BEFORE removing from batcher so the change can be processed
 	node, ok := t.state.GetNodeByID(id)
 	if ok {
-		t.AddWork(change.NodeOfflineFor(node))
+		t.AddWork(change.NodeOffline(node.ID()))
 	}
 
 	// Finally remove from the real batcher
@@ -159,14 +158,14 @@ type node struct {
 //
 // Returns TestData struct containing all created entities and a cleanup function.
 func setupBatcherWithTestData(
-	t testing.TB,
+	tb testing.TB,
 	bf batcherFunc,
 	userCount, nodesPerUser, bufferSize int,
 ) (*TestData, func()) {
-	t.Helper()
+	tb.Helper()
 
 	// Create database and populate with test data first
-	tmpDir := t.TempDir()
+	tmpDir := tb.TempDir()
 	dbPath := tmpDir + "/headscale_test.db"
 
 	prefixV4 := netip.MustParsePrefix("100.64.0.0/10")
@@ -189,7 +188,7 @@ func setupBatcherWithTestData(
 		DERP: types.DERPConfig{
 			ServerEnabled: false,
 			DERPMap: &tailcfg.DERPMap{
-				Regions: map[int]*tailcfg.DERPRegion{
+				Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{
 					999: {
 						RegionID: 999,
 					},
@@ -207,7 +206,7 @@ func setupBatcherWithTestData(
 	// Create database and populate it with test data
 	database, err := db.NewHeadscaleDatabase(cfg)
 	if err != nil {
-		t.Fatalf("setting up database: %s", err)
+		tb.Fatalf("setting up database: %s", err)
 	}
 
 	// Create test users and nodes in the database
@@ -227,12 +226,12 @@ func setupBatcherWithTestData(
 	// Now create state using the same database
 	state, err := state.NewState(cfg)
 	if err != nil {
-		t.Fatalf("Failed to create state: %v", err)
+		tb.Fatalf("Failed to create state: %v", err)
 	}
 
 	derpMap, err := derp.GetDERPMap(cfg.DERP)
-	require.NoError(t, err)
-	require.NotNil(t, derpMap)
+	require.NoError(tb, err)
+	require.NotNil(tb, derpMap)
 
 	state.SetDERPMap(derpMap)
 
@@ -249,7 +248,7 @@ func setupBatcherWithTestData(
 
 	_, err = state.SetPolicy([]byte(allowAllPolicy))
 	if err != nil {
-		t.Fatalf("Failed to set allow-all policy: %v", err)
+		tb.Fatalf("Failed to set allow-all policy: %v", err)
 	}
 
 	// Create batcher with the state and wrap it for testing
@@ -349,7 +348,7 @@ func assertDERPMapResponse(t *testing.T, resp *tailcfg.MapResponse) {
 
 	assert.NotNil(t, resp.DERPMap, "DERPMap should not be nil in response")
 	assert.Len(t, resp.DERPMap.Regions, 1, "Expected exactly one DERP region in response")
-	assert.Equal(t, 999, resp.DERPMap.Regions[999].RegionID, "Expected DERP region ID to be 999")
+	assert.Equal(t, tailcfg.DERPRegionID(999), resp.DERPMap.Regions[999].RegionID, "Expected DERP region ID to be 999")
 }
 
 func assertOnlineMapResponse(t *testing.T, resp *tailcfg.MapResponse, expected bool) {
@@ -574,12 +573,6 @@ func TestEnhancedTrackingWithBatcher(t *testing.T) {
 // and ensure all nodes can see all other nodes. This is a critical test for mesh network
 // functionality where every node must be able to communicate with every other node.
 func TestBatcherScalabilityAllToAll(t *testing.T) {
-	// Reduce verbose application logging for cleaner test output
-	originalLevel := zerolog.GlobalLevel()
-	defer zerolog.SetGlobalLevel(originalLevel)
-
-	zerolog.SetGlobalLevel(zerolog.ErrorLevel)
-
 	// Test cases: different node counts to stress test the all-to-all connectivity
 	testCases := []struct {
 		name      string
@@ -1106,6 +1099,72 @@ func TestBatcherWorkQueueBatching(t *testing.T) {
 
 					return
 				}
+			}
+		})
+	}
+}
+
+// TestBatcherCoalescesPolicyRecomputesPerTick proves that many identical
+// broadcast policy changes arriving in a single batcher tick collapse to one
+// runtime peer recompute per node. Without coalescing, each PolicyChange drives
+// a separate full netmap rebuild for every connected node (the reconnect-storm
+// fan-out); with it, a node sees at most one recompute per tick.
+func TestBatcherCoalescesPolicyRecomputesPerTick(t *testing.T) {
+	for _, bf := range allBatcherFunctions {
+		t.Run(bf.name, func(t *testing.T) {
+			const (
+				nodesPerUser         = 4
+				policyChangesPerTick = 8
+			)
+
+			testData, cleanup := setupBatcherWithTestData(t, bf.fn, 1, nodesPerUser, 100)
+			defer cleanup()
+
+			batcher := testData.Batcher
+			for i := range testData.Nodes {
+				n := &testData.Nodes[i]
+				require.NoError(t, batcher.AddNode(n.n.ID, n.ch, tailcfg.CapabilityVersion(100), nil))
+			}
+
+			// Many identical broadcast policy changes, then a DERP-map change as
+			// a sentinel. All land in one tick; the sentinel rides the same work
+			// item after the recompute(s), so its arrival marks the end of this
+			// tick's policy responses for a node.
+			for range policyChangesPerTick {
+				batcher.AddWork(change.PolicyChange())
+			}
+
+			batcher.AddWork(change.DERPMap())
+
+			for i := range testData.Nodes {
+				id := testData.Nodes[i].n.ID
+				ch := testData.Nodes[i].ch
+
+				policyResponses := 0
+				deadline := time.After(2 * time.Second)
+
+			drain:
+				for {
+					select {
+					case resp := <-ch:
+						switch {
+						case resp.DERPMap != nil && len(resp.Peers) == 0:
+							// Sentinel: every policy recompute for this tick has
+							// already been delivered to this node.
+							break drain
+						case len(resp.PacketFilters) > 0 && len(resp.Peers) == 0:
+							// A runtime peer recompute (policyChangeResponse):
+							// packet filters and incremental peers, no full list.
+							policyResponses++
+						}
+					case <-deadline:
+						t.Fatalf("node %d never received the DERP sentinel", id)
+					}
+				}
+
+				assert.LessOrEqualf(t, policyResponses, 1,
+					"node %d received %d policy recomputes in one tick; identical recomputes must coalesce to one",
+					id, policyResponses)
 			}
 		})
 	}
@@ -2216,4 +2275,86 @@ func TestRemoveNodeChannelAlreadyRemoved(t *testing.T) {
 // unwrapBatcher extracts the underlying *Batcher from the test wrapper.
 func unwrapBatcher(b *testBatcherWrapper) *Batcher {
 	return b.Batcher
+}
+
+// TestAddWorkDropsEmptyChanges ensures an empty-only batch produces no
+// pending entries on any recipient node.
+func TestAddWorkDropsEmptyChanges(t *testing.T) {
+	lb := setupLightweightBatcher(t, 5, 16)
+	defer lb.cleanup()
+
+	// A zero-value change.Change is empty: no peers changed, no patches,
+	// no full update, no removal.
+	empty := change.Change{}
+	require.True(t, empty.IsEmpty(), "zero change must be empty")
+
+	lb.b.AddWork(empty)
+
+	require.Equal(t, 0, countTotalPending(lb.b),
+		"empty change must not create pending entries on any node")
+	require.Equal(t, 0, countNodesPending(lb.b),
+		"empty change must not mark any node as having pending work")
+}
+
+// TestAddWorkEmptyMixedWithReal ensures empty changes dropped from a batch
+// do not affect delivery of the real changes alongside them.
+func TestAddWorkEmptyMixedWithReal(t *testing.T) {
+	lb := setupLightweightBatcher(t, 3, 16)
+	defer lb.cleanup()
+
+	added := change.NodeAdded(types.NodeID(42))
+	empty := change.Change{}
+
+	lb.b.AddWork(empty, added, empty)
+
+	// The real change must land for every connected node; empties must not
+	// add anything.
+	require.Equal(t, 3, countNodesPending(lb.b),
+		"all 3 nodes should have the real change pending")
+
+	for id := range lb.channels {
+		pending := getPendingForNode(lb.b, id)
+		require.Len(t, pending, 1,
+			"node %d must have exactly the one real change pending, no empties", id)
+	}
+}
+
+// TestAddWorkFullUpdateUnaffectedByEmpty ensures that a full update in
+// the batch still takes precedence and replaces pending state, regardless
+// of any empty changes in the same batch.
+func TestAddWorkFullUpdateUnaffectedByEmpty(t *testing.T) {
+	lb := setupLightweightBatcher(t, 3, 16)
+	defer lb.cleanup()
+
+	lb.b.AddWork(change.Change{}, change.FullUpdate(), change.Change{})
+
+	for id := range lb.channels {
+		pending := getPendingForNode(lb.b, id)
+		require.Len(t, pending, 1,
+			"node %d pending should be the single full update", id)
+		require.True(t, pending[0].IsFull(),
+			"node %d pending entry must be the full update", id)
+	}
+}
+
+// TestAddWorkPeersRemovedNotTreatedAsEmpty ensures the empty filter does
+// not swallow a PeersRemoved change — deletion cleanup must still run, and
+// surviving recipients must still see the removal.
+func TestAddWorkPeersRemovedNotTreatedAsEmpty(t *testing.T) {
+	lb := setupLightweightBatcher(t, 4, 16)
+	defer lb.cleanup()
+
+	// Remove node 4.
+	removal := change.NodeRemoved(types.NodeID(4))
+	require.False(t, removal.IsEmpty(), "PeersRemoved change is not empty")
+
+	lb.b.AddWork(removal)
+
+	// Node 4 must be evicted from the batcher.
+	_, exists := lb.b.nodes.Load(types.NodeID(4))
+	require.False(t, exists, "removed node must be evicted from batcher")
+
+	// Surviving nodes must see the removal pending.
+	require.Equal(t, 3, countNodesPending(lb.b),
+		"surviving 3 nodes must have the removal pending")
 }

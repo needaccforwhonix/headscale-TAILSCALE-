@@ -21,10 +21,9 @@ import (
 	"testing"
 	"time"
 
-	v1 "github.com/juanfont/headscale/gen/go/headscale/v1"
+	clientv1 "github.com/juanfont/headscale/gen/client/v1"
 	"github.com/juanfont/headscale/hscontrol/capver"
 	"github.com/juanfont/headscale/hscontrol/types"
-	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/juanfont/headscale/integration/dockertestutil"
 	"github.com/juanfont/headscale/integration/dsic"
 	"github.com/juanfont/headscale/integration/hsic"
@@ -42,6 +41,7 @@ import (
 	"tailscale.com/envknob"
 	"tailscale.com/util/mak"
 	"tailscale.com/util/multierr"
+	"tailscale.com/util/rands"
 )
 
 const (
@@ -56,7 +56,7 @@ var (
 	errNoClientFound        = errors.New("client not found")
 
 	// AllVersions represents a list of Tailscale versions the suite
-	// uses to test compatibility with the ControlServer.
+	// uses to test compatibility with the [ControlServer].
 	//
 	// The list contains two special cases, "head" and "unstable" which
 	// points to the current tip of Tailscale's main branch and the latest
@@ -78,7 +78,7 @@ var (
 	)
 )
 
-// User represents a User in the ControlServer and a map of TailscaleClient's
+// User represents a User in the [ControlServer] and a map of [TailscaleClient]'s
 // associated with the User.
 type User struct {
 	Clients map[string]TailscaleClient
@@ -88,10 +88,10 @@ type User struct {
 	syncWaitGroup   errgroup.Group
 }
 
-// Scenario is a representation of an environment with one ControlServer and
-// one or more User's and its associated TailscaleClients.
+// Scenario is a representation of an environment with one [ControlServer] and
+// one or more [User]'s and its associated [TailscaleClient]s.
 // A Scenario is intended to simplify setting up a new testcase for testing
-// a ControlServer with TailscaleClients.
+// a [ControlServer] with [TailscaleClient]s.
 // TODO(kradalby): make control server configurable, test correctness with Tailscale SaaS.
 type Scenario struct {
 	// TODO(kradalby): support multiple headcales for later, currently only
@@ -177,12 +177,32 @@ func (s *Scenario) prefixedNetworkName(name string) string {
 	return s.testHashPrefix + "-" + name
 }
 
-// NewScenario creates a test Scenario which can be used to bootstraps a ControlServer with
-// a set of Users and TailscaleClients.
+// NewScenario creates a test [Scenario] which can be used to bootstraps a [ControlServer] with
+// a set of [User]s and [TailscaleClient]s.
 func NewScenario(spec ScenarioSpec) (*Scenario, error) {
 	pool, err := dockertest.NewPool("")
 	if err != nil {
 		return nil, fmt.Errorf("connecting to docker: %w", err)
+	}
+
+	// dockertest's bundled go-dockerclient stamps image builds with API
+	// v1.25 (the `ver` tag on BuildImageOptions.Dockerfile) whenever the
+	// client has no pinned version. Docker Engine 29 raised the minimum API
+	// version to 1.40 and rejects v1.25 with a 400, which surfaces mid-build
+	// as a "write: broken pipe". Pin the client to the daemon's reported API
+	// version so build (and every other) request uses an accepted path.
+	version, err := pool.Client.Version()
+	if err != nil {
+		return nil, fmt.Errorf("querying docker API version: %w", err)
+	}
+
+	if api := version.Get("ApiVersion"); api != "" {
+		client, err := docker.NewVersionedClientFromEnv(api)
+		if err != nil {
+			return nil, fmt.Errorf("pinning docker client to API version %s: %w", api, err)
+		}
+
+		pool.Client = client
 	}
 
 	// Opportunity to clean up unreferenced networks.
@@ -197,7 +217,7 @@ func NewScenario(spec ScenarioSpec) (*Scenario, error) {
 		pool.MaxWait = spec.MaxWait
 	}
 
-	testHashPrefix := "hs-" + util.MustGenerateRandomStringDNSSafe(scenarioHashLength)
+	testHashPrefix := "hs-" + rands.HexString(scenarioHashLength)
 	s := &Scenario{
 		controlServers: xsync.NewMap[string, ControlServer](),
 		users:          make(map[string]*User),
@@ -211,7 +231,7 @@ func NewScenario(spec ScenarioSpec) (*Scenario, error) {
 
 	var userToNetwork map[string]*dockertest.Network
 
-	if spec.Networks != nil || len(spec.Networks) != 0 {
+	if spec.Networks != nil {
 		for name, netSpec := range s.spec.Networks {
 			networkName := testHashPrefix + "-" + name
 
@@ -406,8 +426,6 @@ func (s *Scenario) ShutdownAssertNoPanics(t *testing.T) {
 	}
 
 	if s.mockOIDC.r != nil {
-		s.mockOIDC.r.Close()
-
 		err := s.mockOIDC.r.Close()
 		if err != nil {
 			log.Printf("tearing down oidc server: %s", err)
@@ -422,15 +440,15 @@ func (s *Scenario) ShutdownAssertNoPanics(t *testing.T) {
 	}
 }
 
-// Shutdown shuts down and cleans up all the containers (ControlServer, TailscaleClient)
+// Shutdown shuts down and cleans up all the containers ([ControlServer], [TailscaleClient])
 // and networks associated with it.
-// In addition, it will save the logs of the ControlServer to `/tmp/control` in the
+// In addition, it will save the logs of the [ControlServer] to `/tmp/control` in the
 // environment running the tests.
 func (s *Scenario) Shutdown() {
 	s.ShutdownAssertNoPanics(nil)
 }
 
-// Users returns the name of all users associated with the Scenario.
+// Users returns the name of all users associated with the [Scenario].
 func (s *Scenario) Users() []string {
 	users := make([]string, 0, len(s.users))
 	for user := range s.users {
@@ -443,8 +461,8 @@ func (s *Scenario) Users() []string {
 /// Headscale related stuff
 // Note: These functions assume that there is a _single_ headscale instance for now
 
-// Headscale returns a ControlServer instance based on hsic (HeadscaleInContainer)
-// If the Scenario already has an instance, the pointer to the running container
+// Headscale returns a [ControlServer] instance based on hsic ([hsic.HeadscaleInContainer]).
+// If the [Scenario] already has an instance, the pointer to the running container
 // will be return, otherwise a new instance will be created.
 // TODO(kradalby): make port and headscale configurable, multiple instances support?
 func (s *Scenario) Headscale(opts ...hsic.Option) (ControlServer, error) {
@@ -474,12 +492,12 @@ func (s *Scenario) Headscale(opts ...hsic.Option) (ControlServer, error) {
 	return headscale, nil
 }
 
-// Pool returns the dockertest pool for the scenario.
+// Pool returns the [dockertest.Pool] for the scenario.
 func (s *Scenario) Pool() *dockertest.Pool {
 	return s.pool
 }
 
-// GetOrCreateUser gets or creates a user in the scenario.
+// GetOrCreateUser gets or creates a user in the [Scenario].
 func (s *Scenario) GetOrCreateUser(userStr string) *User {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -497,12 +515,12 @@ func (s *Scenario) GetOrCreateUser(userStr string) *User {
 }
 
 // CreatePreAuthKey creates a "pre authentorised key" to be created in the
-// Headscale instance on behalf of the Scenario.
+// Headscale instance on behalf of the [Scenario].
 func (s *Scenario) CreatePreAuthKey(
 	user uint64,
 	reusable bool,
 	ephemeral bool,
-) (*v1.PreAuthKey, error) {
+) (*clientv1.PreAuthKey, error) {
 	if headscale, err := s.Headscale(); err == nil { //nolint:noinlineerr
 		key, err := headscale.CreateAuthKey(user, reusable, ephemeral)
 		if err != nil {
@@ -516,8 +534,8 @@ func (s *Scenario) CreatePreAuthKey(
 }
 
 // CreatePreAuthKeyWithOptions creates a "pre authorised key" with the specified options
-// to be created in the Headscale instance on behalf of the Scenario.
-func (s *Scenario) CreatePreAuthKeyWithOptions(opts hsic.AuthKeyOptions) (*v1.PreAuthKey, error) {
+// to be created in the Headscale instance on behalf of the [Scenario].
+func (s *Scenario) CreatePreAuthKeyWithOptions(opts hsic.AuthKeyOptions) (*clientv1.PreAuthKey, error) {
 	headscale, err := s.Headscale()
 	if err != nil {
 		return nil, fmt.Errorf("creating preauth key with options: %w", errNoHeadscaleAvailable)
@@ -532,13 +550,13 @@ func (s *Scenario) CreatePreAuthKeyWithOptions(opts hsic.AuthKeyOptions) (*v1.Pr
 }
 
 // CreatePreAuthKeyWithTags creates a "pre authorised key" with the specified tags
-// to be created in the Headscale instance on behalf of the Scenario.
+// to be created in the Headscale instance on behalf of the [Scenario].
 func (s *Scenario) CreatePreAuthKeyWithTags(
 	user uint64,
 	reusable bool,
 	ephemeral bool,
 	tags []string,
-) (*v1.PreAuthKey, error) {
+) (*clientv1.PreAuthKey, error) {
 	headscale, err := s.Headscale()
 	if err != nil {
 		return nil, fmt.Errorf("creating preauth key with tags: %w", errNoHeadscaleAvailable)
@@ -552,9 +570,9 @@ func (s *Scenario) CreatePreAuthKeyWithTags(
 	return key, nil
 }
 
-// CreateUser creates a User to be created in the
-// Headscale instance on behalf of the Scenario.
-func (s *Scenario) CreateUser(user string) (*v1.User, error) {
+// CreateUser creates a [User] to be created in the
+// Headscale instance on behalf of the [Scenario].
+func (s *Scenario) CreateUser(user string) (*clientv1.User, error) {
 	if headscale, err := s.Headscale(); err == nil { //nolint:noinlineerr
 		u, err := headscale.CreateUser(user)
 		if err != nil {
@@ -590,7 +608,8 @@ func (s *Scenario) CreateTailscaleNode(
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	opts = append(opts,
+	opts = append(
+		opts,
 		tsic.WithCACert(cert),
 		tsic.WithHeadscaleName(hostname),
 	)
@@ -619,8 +638,8 @@ func (s *Scenario) CreateTailscaleNode(
 	return tsClient, nil
 }
 
-// CreateTailscaleNodesInUser creates and adds a new TailscaleClient to a
-// User in the Scenario.
+// CreateTailscaleNodesInUser creates and adds a new [TailscaleClient] to a
+// [User] in the [Scenario].
 func (s *Scenario) CreateTailscaleNodesInUser(
 	userStr string,
 	requestedVersion string,
@@ -664,7 +683,8 @@ func (s *Scenario) CreateTailscaleNodesInUser(
 
 			s.mu.Lock()
 
-			opts = append(opts,
+			opts = append(
+				opts,
 				tsic.WithCACert(cert),
 				tsic.WithHeadscaleName(hostname),
 				tsic.WithExtraHosts(extraHosts),
@@ -720,8 +740,8 @@ func (s *Scenario) CreateTailscaleNodesInUser(
 	return fmt.Errorf("adding tailscale node: %w", errNoUserAvailable)
 }
 
-// RunTailscaleUp will log in all of the TailscaleClients associated with a
-// User to the given ControlServer (by URL).
+// RunTailscaleUp will log in all of the [TailscaleClient]s associated with a
+// [User] to the given [ControlServer] (by URL).
 func (s *Scenario) RunTailscaleUp(
 	userStr, loginServer, authKey string,
 ) error {
@@ -752,7 +772,7 @@ func (s *Scenario) RunTailscaleUp(
 	return fmt.Errorf("bringing up tailscale node: %w", errNoUserAvailable)
 }
 
-// CountTailscale returns the total number of TailscaleClients in a Scenario.
+// CountTailscale returns the total number of [TailscaleClient]s in a [Scenario].
 // This is the sum of Users x TailscaleClients.
 func (s *Scenario) CountTailscale() int {
 	count := 0
@@ -764,8 +784,8 @@ func (s *Scenario) CountTailscale() int {
 	return count
 }
 
-// WaitForTailscaleSync blocks execution until all the TailscaleClient reports
-// to have all other TailscaleClients present in their netmap.NetworkMap.
+// WaitForTailscaleSync blocks execution until all the [TailscaleClient] reports
+// to have all other [TailscaleClient]s present in their [netmap.NetworkMap].
 func (s *Scenario) WaitForTailscaleSync() error {
 	tsCount := s.CountTailscale()
 
@@ -784,49 +804,65 @@ func (s *Scenario) WaitForTailscaleSync() error {
 	return err
 }
 
-// WaitForTailscaleSyncPerUser blocks execution until each TailscaleClient has the expected
-// number of peers for its user. This is useful for policies like autogroup:self where nodes
-// only see same-user peers, not all nodes in the network.
-func (s *Scenario) WaitForTailscaleSyncPerUser(timeout, retryInterval time.Duration) error {
+// SyncOption configures [Scenario.WaitForTailscaleSyncPerUser].
+type SyncOption func(*syncOptions)
+
+type syncOptions struct {
+	preBarrier func(context.Context) error
+}
+
+// WithPreBarrier runs a precondition check before per-user peer-count
+// waits begin, sharing the outer timeout via context. Use to gate on
+// a server-side signal (e.g. policy compile) that the peer-count
+// alone cannot observe.
+func WithPreBarrier(barrier func(context.Context) error) SyncOption {
+	return func(o *syncOptions) { o.preBarrier = barrier }
+}
+
+// WaitForTailscaleSyncPerUser blocks until each [TailscaleClient] has
+// the expected per-user peer count (necessary for policies like
+// autogroup:self where cross-user peers are invisible).
+func (s *Scenario) WaitForTailscaleSyncPerUser(timeout, retryInterval time.Duration, opts ...SyncOption) error {
+	options := syncOptions{}
+	for _, opt := range opts {
+		opt(&options)
+	}
+
+	if options.preBarrier != nil {
+		barrierCtx, cancel := context.WithTimeout(context.Background(), timeout)
+
+		err := options.preBarrier(barrierCtx)
+
+		cancel()
+
+		if err != nil {
+			return fmt.Errorf("pre-barrier: %w", err)
+		}
+	}
+
+	// Calculate expected peer count: number of nodes in this user minus 1 (self)
+	return s.waitPeers(func(u *User) int { return len(u.Clients) - 1 }, timeout, retryInterval)
+}
+
+// WaitForTailscaleSyncWithPeerCount blocks execution until all the [TailscaleClient] reports
+// to have all other [TailscaleClient]s present in their [netmap.NetworkMap].
+func (s *Scenario) WaitForTailscaleSyncWithPeerCount(peerCount int, timeout, retryInterval time.Duration) error {
+	return s.waitPeers(func(*User) int { return peerCount }, timeout, retryInterval)
+}
+
+// waitPeers blocks until every [TailscaleClient] reports the expected peer
+// count returned by perUser for its owning user, fanning out per user.
+func (s *Scenario) waitPeers(perUser func(*User) int, timeout, retryInterval time.Duration) error {
 	var allErrors []error
 
 	for _, user := range s.users {
-		// Calculate expected peer count: number of nodes in this user minus 1 (self)
-		expectedPeers := len(user.Clients) - 1
+		expectedCount := perUser(user)
 
 		for _, client := range user.Clients {
 			c := client
-			expectedCount := expectedPeers
 
 			user.syncWaitGroup.Go(func() error {
 				return c.WaitForPeers(expectedCount, timeout, retryInterval)
-			})
-		}
-
-		err := user.syncWaitGroup.Wait()
-		if err != nil {
-			allErrors = append(allErrors, err)
-		}
-	}
-
-	if len(allErrors) > 0 {
-		return multierr.New(allErrors...)
-	}
-
-	return nil
-}
-
-// WaitForTailscaleSyncWithPeerCount blocks execution until all the TailscaleClient reports
-// to have all other TailscaleClients present in their netmap.NetworkMap.
-func (s *Scenario) WaitForTailscaleSyncWithPeerCount(peerCount int, timeout, retryInterval time.Duration) error {
-	var allErrors []error
-
-	for _, user := range s.users {
-		for _, client := range user.Clients {
-			c := client
-
-			user.syncWaitGroup.Go(func() error {
-				return c.WaitForPeers(peerCount, timeout, retryInterval)
 			})
 		}
 
@@ -858,7 +894,7 @@ func (s *Scenario) CreateHeadscaleEnv(
 }
 
 // CreateHeadscaleEnv starts the headscale environment and the clients
-// according to the ScenarioSpec passed to the Scenario.
+// according to the [ScenarioSpec] passed to the [Scenario].
 func (s *Scenario) createHeadscaleEnv(
 	withURL bool,
 	tsOpts []tsic.Option,
@@ -868,7 +904,7 @@ func (s *Scenario) createHeadscaleEnv(
 }
 
 // createHeadscaleEnvWithTags starts the headscale environment and the clients
-// according to the ScenarioSpec passed to the Scenario. If preAuthKeyTags is
+// according to the [ScenarioSpec] passed to the [Scenario]. If preAuthKeyTags is
 // non-empty and withURL is false, the tags will be applied to the PreAuthKey
 // (tags-as-identity model).
 //
@@ -889,7 +925,7 @@ func (s *Scenario) createHeadscaleEnvWithTags(
 	}
 
 	for _, user := range s.spec.Users {
-		var u *v1.User
+		var u *clientv1.User
 
 		if s.spec.OIDCSkipUserCreation {
 			// Only register locally — OIDC login will create the headscale user.
@@ -928,18 +964,18 @@ func (s *Scenario) createHeadscaleEnvWithTags(
 			}
 		} else {
 			// Use tagged PreAuthKey if tags are provided (tags-as-identity model)
-			var key *v1.PreAuthKey
+			var key *clientv1.PreAuthKey
 			if len(preAuthKeyTags) > 0 {
-				key, err = s.CreatePreAuthKeyWithTags(u.GetId(), true, false, preAuthKeyTags)
+				key, err = s.CreatePreAuthKeyWithTags(mustParseID(u.Id), true, false, preAuthKeyTags)
 			} else {
-				key, err = s.CreatePreAuthKey(u.GetId(), true, false)
+				key, err = s.CreatePreAuthKey(mustParseID(u.Id), true, false)
 			}
 
 			if err != nil {
 				return err
 			}
 
-			err = s.RunTailscaleUp(user, headscale.GetEndpoint(), key.GetKey())
+			err = s.RunTailscaleUp(user, headscale.GetEndpoint(), key.Key)
 			if err != nil {
 				return err
 			}
@@ -1076,6 +1112,11 @@ func (j *debugJar) Dump(w io.Writer) {
 	}
 }
 
+// registerConfirmCSRFField is the name of both the hidden CSRF form field
+// and the cookie on the OIDC registration confirmation interstitial. It
+// mirrors registerConfirmCSRFCookie in hscontrol, which is unexported.
+const registerConfirmCSRFField = "headscale_register_confirm"
+
 func copyCookie(c *http.Cookie) *http.Cookie {
 	cc := *c
 	return &cc
@@ -1189,10 +1230,11 @@ func doLoginURLWithClient(hostname string, loginURL *url.URL, hc *http.Client, f
 		}
 	}
 
-	// The OIDC registration flow now renders a confirmation interstitial
-	// (POST form) instead of completing immediately. Detect the form and
+	// The OIDC registration flow renders a confirmation interstitial
+	// (POST form) instead of completing immediately. Detect the form by its
+	// CSRF field, which does not move when the form action does, and
 	// auto-submit it so integration tests behave like a real browser.
-	if followRedirects && strings.Contains(body, `action="/register/confirm/`) {
+	if followRedirects && strings.Contains(body, `name="`+registerConfirmCSRFField+`"`) {
 		confirmBody, confirmURL, confirmErr := submitConfirmForm(hostname, body, resp, hc)
 		if confirmErr != nil {
 			return body, redirectURL, confirmErr
@@ -1231,7 +1273,7 @@ func submitConfirmForm(
 
 	// Extract hidden CSRF input value. The rendered <input> has
 	// attributes in name-type-value order so we grab the whole tag.
-	before, _, ok := strings.Cut(htmlBody, `name="headscale_register_confirm"`)
+	before, _, ok := strings.Cut(htmlBody, `name="`+registerConfirmCSRFField+`"`)
 	if !ok {
 		return "", nil, fmt.Errorf("%s confirm form: no CSRF input", hostname) //nolint:err113
 	}
@@ -1257,18 +1299,17 @@ func submitConfirmForm(
 	valEnd := strings.Index(inputTag[valStart:], `"`)
 	csrfToken := inputTag[valStart : valStart+valEnd]
 
-	// Build the absolute POST URL from the response's request URL.
-	base := prevResp.Request.URL
-	confirmURL := &url.URL{
-		Scheme: base.Scheme,
-		Host:   base.Host,
-		Path:   formAction,
+	// Resolve the form action against the page it was served from, so an
+	// absolute and a relative action both work.
+	confirmURL, err := prevResp.Request.URL.Parse(formAction)
+	if err != nil {
+		return "", nil, fmt.Errorf("%s confirm form: resolving action %q: %w", hostname, formAction, err)
 	}
 
 	log.Printf("%s auto-submitting confirm form: %s", hostname, confirmURL)
 
 	formData := url.Values{
-		"headscale_register_confirm": {csrfToken},
+		registerConfirmCSRFField: {csrfToken},
 	}
 
 	ctx := context.Background()
@@ -1349,6 +1390,7 @@ func (t LoggingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error
 		return nil, err
 	}
 
+	//nolint:gosec // G706: integration-only log of trusted scenario state
 	log.Printf(`
 ---
 %s - method: %s | url: %s
@@ -1359,8 +1401,8 @@ func (t LoggingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error
 	return resp, nil
 }
 
-// GetIPs returns all netip.Addr of TailscaleClients associated with a User
-// in a Scenario.
+// GetIPs returns all [netip.Addr] of [TailscaleClient]s associated with a [User]
+// in a [Scenario].
 func (s *Scenario) GetIPs(user string) ([]netip.Addr, error) {
 	var ips []netip.Addr
 
@@ -1380,22 +1422,16 @@ func (s *Scenario) GetIPs(user string) ([]netip.Addr, error) {
 	return ips, fmt.Errorf("getting IPs: %w", errNoUserAvailable)
 }
 
-// GetClients returns all TailscaleClients associated with a User in a Scenario.
+// GetClients returns all [TailscaleClient]s associated with a [User] in a [Scenario].
 func (s *Scenario) GetClients(user string) ([]TailscaleClient, error) {
-	var clients []TailscaleClient
-
 	if ns, ok := s.users[user]; ok {
-		for _, client := range ns.Clients {
-			clients = append(clients, client)
-		}
-
-		return clients, nil
+		return xmaps.Values(ns.Clients), nil
 	}
 
-	return clients, fmt.Errorf("getting clients: %w", errNoUserAvailable)
+	return nil, fmt.Errorf("getting clients: %w", errNoUserAvailable)
 }
 
-// ListTailscaleClients returns a list of TailscaleClients given the Users
+// ListTailscaleClients returns a list of [TailscaleClient]s given the [User]s
 // passed as parameters.
 func (s *Scenario) ListTailscaleClients(users ...string) ([]TailscaleClient, error) {
 	var allClients []TailscaleClient
@@ -1416,7 +1452,7 @@ func (s *Scenario) ListTailscaleClients(users ...string) ([]TailscaleClient, err
 	return allClients, nil
 }
 
-// FindTailscaleClientByIP returns a TailscaleClient associated with an IP address
+// FindTailscaleClientByIP returns a [TailscaleClient] associated with an IP address
 // if it exists.
 func (s *Scenario) FindTailscaleClientByIP(ip netip.Addr) (TailscaleClient, error) {
 	clients, err := s.ListTailscaleClients()
@@ -1434,7 +1470,7 @@ func (s *Scenario) FindTailscaleClientByIP(ip netip.Addr) (TailscaleClient, erro
 	return nil, errNoClientFound
 }
 
-// ListTailscaleClientsIPs returns a list of netip.Addr based on Users
+// ListTailscaleClientsIPs returns a list of [netip.Addr] based on [User]s
 // passed as parameters.
 func (s *Scenario) ListTailscaleClientsIPs(users ...string) ([]netip.Addr, error) {
 	var allIps []netip.Addr
@@ -1455,7 +1491,7 @@ func (s *Scenario) ListTailscaleClientsIPs(users ...string) ([]netip.Addr, error
 	return allIps, nil
 }
 
-// ListTailscaleClientsFQDNs returns a list of FQDN based on Users
+// ListTailscaleClientsFQDNs returns a list of FQDN based on [User]s
 // passed as parameters.
 func (s *Scenario) ListTailscaleClientsFQDNs(users ...string) ([]string, error) {
 	allFQDNs := make([]string, 0)
@@ -1477,8 +1513,8 @@ func (s *Scenario) ListTailscaleClientsFQDNs(users ...string) ([]string, error) 
 	return allFQDNs, nil
 }
 
-// WaitForTailscaleLogout blocks execution until all TailscaleClients have
-// logged out of the ControlServer.
+// WaitForTailscaleLogout blocks execution until all [TailscaleClient]s have
+// logged out of the [ControlServer].
 func (s *Scenario) WaitForTailscaleLogout() error {
 	for _, user := range s.users {
 		for _, client := range user.Clients {
@@ -1560,7 +1596,7 @@ func (s *Scenario) runMockOIDC(accessTTL time.Duration, users []mockoidc.MockUse
 
 	portNotation := fmt.Sprintf("%d/tcp", port)
 
-	hash, _ := util.GenerateRandomStringDNSSafe(hsicOIDCMockHashLength)
+	hash := rands.HexString(hsicOIDCMockHashLength)
 
 	hostname := "hs-oidcmock-" + hash
 
@@ -1605,7 +1641,8 @@ func (s *Scenario) runMockOIDC(accessTTL time.Duration, users []mockoidc.MockUse
 	if pmockoidc, err := s.pool.BuildAndRunWithBuildOptions( //nolint:noinlineerr
 		headscaleBuildOptions,
 		mockOidcOptions,
-		dockertestutil.DockerRestartPolicy); err == nil {
+		dockertestutil.DockerRestartPolicy,
+	); err == nil {
 		s.mockOIDC.r = pmockoidc
 	} else {
 		return err
@@ -1667,7 +1704,7 @@ func Webservice(s *Scenario, networkName string) (*dockertest.Resource, error) {
 	// 	log.Fatalf("finding open port: %s", err)
 	// }
 	// portNotation := fmt.Sprintf("%d/tcp", port)
-	hash := util.MustGenerateRandomStringDNSSafe(hsicOIDCMockHashLength)
+	hash := rands.HexString(hsicOIDCMockHashLength)
 
 	hostname := "hs-webservice-" + hash
 
@@ -1698,7 +1735,8 @@ func Webservice(s *Scenario, networkName string) (*dockertest.Resource, error) {
 	web, err := s.pool.BuildAndRunWithBuildOptions(
 		webBOpts,
 		webOpts,
-		dockertestutil.DockerRestartPolicy)
+		dockertestutil.DockerRestartPolicy,
+	)
 	if err != nil {
 		return nil, err
 	}

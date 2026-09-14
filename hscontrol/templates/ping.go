@@ -2,6 +2,7 @@ package templates
 
 import (
 	"fmt"
+	"html"
 	"strings"
 	"time"
 
@@ -16,7 +17,7 @@ type PingResult struct {
 	// Status is "ok", "timeout", or "error".
 	Status string
 
-	// Latency is the round-trip time (only meaningful when Status is "ok").
+	// Latency is the round-trip time (only meaningful when [PingResult.Status] is "ok").
 	Latency time.Duration
 
 	// NodeID is the ID of the pinged node.
@@ -26,7 +27,7 @@ type PingResult struct {
 	Message string
 }
 
-// ConnectedNode is a node currently connected to the batcher,
+// ConnectedNode is a node currently connected to the [mapper.Batcher],
 // displayed as a quick-ping link on the debug ping page.
 type ConnectedNode struct {
 	ID       types.NodeID
@@ -35,10 +36,9 @@ type ConnectedNode struct {
 }
 
 // PingPage renders the /debug/ping page with a form, optional result,
-// and a list of connected nodes as quick-ping links.
+// and a list of connected nodes ([ConnectedNode]) as quick-ping links.
 func PingPage(query string, result *PingResult, nodes []ConnectedNode) *elem.Element {
 	children := []elem.Node{
-		headscaleLogo(),
 		H1(elem.Text("Ping Node")),
 		P(elem.Text("Check if a connected node responds to a PingRequest.")),
 		pingExplanation(),
@@ -53,16 +53,12 @@ func PingPage(query string, result *PingResult, nodes []ConnectedNode) *elem.Ele
 		children = append(children, connectedNodeList(nodes))
 	}
 
-	children = append(children, pageFooter())
-
-	return HtmlStructure(
-		elem.Title(nil, elem.Text("Ping Node - Headscale")),
-		mdTypesetBody(children...),
-	)
+	return page("Ping Node - Headscale", children...)
 }
 
 func pingExplanation() *elem.Element {
-	return detailsBox("How does this work?",
+	return detailsBox(
+		"How does this work?",
 		Ol(
 			elem.Li(nil, elem.Text(
 				"The server sends a PingRequest to the target node via its MapResponse stream.",
@@ -87,26 +83,27 @@ func pingExplanation() *elem.Element {
 }
 
 func pingForm(query string) *elem.Element {
-	return elem.Form(attrs.Props{
-		attrs.Method: "POST",
-		attrs.Action: "/debug/ping",
-		attrs.Style: styles.Props{
-			styles.Display:    "flex",
-			styles.Gap:        spaceS,
-			styles.AlignItems: "center",
-			styles.FlexWrap:   "wrap",
-			styles.MarginTop:  spaceM,
-		}.ToInline(),
-	},
+	return elem.Form(
+		attrs.Props{
+			attrs.Method: "POST",
+			attrs.Action: "/debug/ping",
+			attrs.Style: styles.Props{
+				styles.Display:    "flex",
+				styles.Gap:        spaceS,
+				styles.AlignItems: cssCenter,
+				styles.FlexWrap:   "wrap",
+				styles.MarginTop:  spaceM,
+			}.ToInline(),
+		},
 		elem.Input(attrs.Props{
 			attrs.Type:        "text",
 			attrs.Name:        "node",
-			attrs.Value:       query,
+			attrs.Value:       html.EscapeString(query),
 			attrs.Placeholder: "Node ID, IP, or hostname",
 			attrs.Autofocus:   "true",
 			attrs.Style: styles.Props{
 				styles.Padding:      "0.75rem " + spaceM,
-				styles.Border:       "1px solid var(--hs-border)",
+				styles.Border:       cssBorderHS,
 				styles.BorderRadius: "0.375rem",
 				styles.Width:        "280px",
 				styles.MaxWidth:     "100%",
@@ -130,11 +127,12 @@ func connectedNodeList(nodes []ConnectedNode) *elem.Element {
 		items = append(items, elem.Li(nil, A(href, elem.Text(label))))
 	}
 
-	return elem.Div(attrs.Props{
-		attrs.Style: styles.Props{
-			styles.MarginTop: space2XL,
-		}.ToInline(),
-	},
+	return elem.Div(
+		attrs.Props{
+			attrs.Style: styles.Props{
+				styles.MarginTop: space2XL,
+			}.ToInline(),
+		},
 		H2(elem.Text("Connected Nodes")),
 		Ul(items...),
 	)

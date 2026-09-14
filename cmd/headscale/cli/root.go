@@ -22,11 +22,6 @@ func init() {
 		return
 	}
 
-	if slices.Contains(os.Args, "policy") && slices.Contains(os.Args, "check") {
-		zerolog.SetGlobalLevel(zerolog.Disabled)
-		return
-	}
-
 	cobra.OnInitialize(initConfig)
 	rootCmd.PersistentFlags().
 		StringVarP(&cfgFile, "config", "c", "", "config file (default is /etc/headscale/config.yaml)")
@@ -36,7 +31,7 @@ func init() {
 		Bool("force", false, "Disable prompts and forces the execution")
 
 	// Re-enable usage output only for flag-parsing errors; runtime errors
-	// from RunE should never dump usage text.
+	// from [cobra.Command.RunE] should never dump usage text.
 	rootCmd.SetFlagErrorFunc(func(cmd *cobra.Command, err error) error {
 		cmd.SilenceUsage = false
 
@@ -101,13 +96,9 @@ func initConfig() {
 var prereleases = []string{"alpha", "beta", "rc", "dev"}
 
 func isPreReleaseVersion(version string) bool {
-	for _, unstable := range prereleases {
-		if strings.Contains(version, unstable) {
-			return true
-		}
-	}
-
-	return false
+	return slices.ContainsFunc(prereleases, func(unstable string) bool {
+		return strings.Contains(version, unstable)
+	})
 }
 
 // filterPreReleasesIfStable returns a function that filters out
@@ -126,13 +117,7 @@ func filterPreReleasesIfStable(versionFunc func() string) func(string) bool {
 		}
 
 		// If we are on a stable release, filter out pre-releases.
-		for _, ignore := range prereleases {
-			if strings.Contains(tag, ignore) {
-				return true
-			}
-		}
-
-		return false
+		return isPreReleaseVersion(tag)
 	}
 }
 
